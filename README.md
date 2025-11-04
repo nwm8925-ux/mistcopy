@@ -1,5 +1,5 @@
 
-mist_full_clone_single — README
+Maple RainCopy — README
 =================================
 
 This is a single-file, no-deps Python script that copies a Mist org’s config into another org. It’s built for macOS and works anywhere you have Python 3.
