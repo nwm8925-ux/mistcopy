@@ -2,7 +2,7 @@
 Maple RainCopy — README
 =================================
 
-This is a single-file, no-deps Python script that copies a Mist org’s config into another org. It’s built for macOS and works anywhere you have Python 3.
+This is a single-file Python script that copies a Mist org’s config into another org. It works anywhere you have Python 3 (macOS tested, Windows not tested).
 
 The majority of this is vibecoded. 
 
@@ -34,7 +34,7 @@ What it does NOT copy
 
 - Inventory / device claims (you must unclaim/claim between orgs)
 - Users, roles, SSO/SAML, API tokens
-- Floorplans/maps/zones (API doesn’t provide a clean export+import pair)
+- Floorplans/maps/zones/images (API doesn’t provide a clean export+import pair)
 - Secrets: PPSK passphrases, OAuth secrets, private keys
 - Historical analytics/SLE/metrics
 
@@ -42,7 +42,7 @@ What it does NOT copy
 Requirements
 ---------------------------------
 
-- macOS with Python 3.x (the python.org build is fine)
+- Python 3.x (the python.org build is fine)
 - Internet access to your Mist API region (e.g., https://api.ac2.mist.com)
 - Two API tokens: one that can read the source org, one that can write the destination org
 
@@ -57,7 +57,10 @@ Quick start (macOS)
 ---------------------------------
 
 1) Save the script.
-2) Open it (Python IDLE Editor is plenty) and edit the “EDIT THESE” block:
+2) Open a Python-compatible text editor (Python IDLE Editor is plenty)
+3) Copy and paste the script into your text editor
+4) “EDIT THESE” block:
+5) Save and run
 
 API_HOST   = "https://api.ac2.mist.com"
 TOKEN_SRC  = "YOUR_SOURCE_TOKEN"
@@ -73,7 +76,6 @@ DST_SITE_ID = ""
 CA_BUNDLE_PATH = ""
 INSECURE_SSL   = False
 
-3) Save it in IDLE and Run
    
 ---------------------------------
 Common use cases
