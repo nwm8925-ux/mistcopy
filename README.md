@@ -57,7 +57,7 @@ Quick start (macOS)
 ---------------------------------
 
 1) Save the script.
-2) Open it and edit the “EDIT THESE” block:
+2) Open it (Python IDLE Editor is plenty) and edit the “EDIT THESE” block:
 
 API_HOST   = "https://api.ac2.mist.com"
 TOKEN_SRC  = "YOUR_SOURCE_TOKEN"
@@ -73,12 +73,8 @@ DST_SITE_ID = ""
 CA_BUNDLE_PATH = ""
 INSECURE_SSL   = False
 
-3) Make it executable and run:
-chmod +x mist_full_clone_single.py
-./mist_full_clone_single.py
-
-It applies changes. There’s no separate “apply” flag.
-
+3) Save it in IDLE and Run
+   
 ---------------------------------
 Common use cases
 ---------------------------------
