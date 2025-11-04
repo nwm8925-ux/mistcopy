@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""
+Mist full clone (org + sites) — single file, no third-party packages. No deletes. Idempotent upserts.
+
+Quick start (macOS):
+  chmod +x mist_full_clone_single.py
+  ./mist_full_clone_single.py
+
+What it does:
+  - Org: RF templates, network templates, org WLANs, Wx rules, Wx tunnels
+  - Sites: creates missing sites by name, copies site settings, site WLANs, site Wx rules, site Wx tunnels
+  - Safe: upsert by name/SSID, retries on 429/5xx
+  - Excludes: inventory claims, users/roles/SSO, webhooks, analytics, floorplans, PPSK plaintext
+
+If you hit SSL errors on macOS:
+  - Run “Install Certificates.command” from the Python 3.x folder in Applications, or
+  - Set CA_BUNDLE_PATH to a PEM file, or
+  - As a last resort set INSECURE_SSL=True (not recommended).
+"""
+
+# ---------- EDIT THESE ----------
+API_HOST      = "https://api.ac2.mist.com"  # keep https and correct region
+TOKEN_SRC     = ""
+TOKEN_DST     = ""
+SRC_ORG_ID    = ""
+DST_ORG_ID    = ""
+COPY_MODE     = "org-and-sites"  # "org-only", "sites-only", "org-and-sites"
+
+# Limit sites by exact name. Leave empty to copy all sites by name.
+LIMIT_SITE_NAMES = []  # e.g. ["Home A", "Home B"]
+
+# Single-site direct copy by ID (overrides LIMIT_SITE_NAMES when both set)
+SRC_SITE_ID = ""  # e.g. "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+DST_SITE_ID = ""  # e.g. "ffffffff-1111-2222-3333-444444444444"
+
+# SSL options
+CA_BUNDLE_PATH = ""     # e.g. "/Library/Frameworks/Python.framework/Versions/3.13/etc/openssl/cert.pem"
+INSECURE_SSL   = True  # True = disable certificate verification (last resort, not recommended)
+# --------------------------------
+
+import sys, time, json, hashlib, urllib.request, urllib.parse, ssl
+from typing import Any, Dict, List, Optional
+
+# ---------- HTTP (urllib, no requests) ----------
+class Http:
+    def __init__(self, base:str, token:str):
+        self.base = base.rstrip("/")
+        self.token = token
+        # Build SSL context
+        if INSECURE_SSL:
+            self.ctx = ssl._create_unverified_context()
+        else:
+            if CA_BUNDLE_PATH:
+                self.ctx = ssl.create_default_context(cafile=CA_BUNDLE_PATH)
+            else:
+                self.ctx = ssl.create_default_context()
+
+    def call(self, method:str, path:str, params:Optional[Dict[str,Any]]=None,
+             body:Optional[Dict[str,Any]]=None, retries:int=6) -> Any:
+        url = self.base + path
+        if params:
+            q = urllib.parse.urlencode(params, doseq=True)
+            url = url + ("?" + q)
+        data = None
+        headers = {
+            "Authorization": f"Token {self.token}",
+            "Content-Type": "application/json",
+        }
+        if body is not None:
+            data = json.dumps(body, separators=(",",":")).encode("utf-8")
+        for attempt in range(retries+1):
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req, context=self.ctx, timeout=45) as r:
+                    b = r.read()
+                    return json.loads(b.decode("utf-8") or "null") if b else None
+            except urllib.error.HTTPError as e:
+                code = e.getcode()
+                if code in (429, 502, 503, 504) and attempt < retries:
+                    time.sleep(1.2 * (attempt+1))
+                    continue
+                try:
+                    err_body = e.read().decode("utf-8")[:600]
+                except Exception:
+                    err_body = ""
+                raise RuntimeError(f"{method} {path} -> {code} {err_body}")
+            except urllib.error.URLError as e:
+                if attempt < retries:
+                    time.sleep(1.0 * (attempt+1))
+                    continue
+                raise
+
+    def get(self, path:str, params:Optional[Dict[str,Any]]=None):
+        return self.call("GET", path, params=params)
+
+    def post(self, path:str, body:Dict[str,Any]):
+        return self.call("POST", path, body=body)
+
+    def put(self, path:str, body:Dict[str,Any]):
+        return self.call("PUT", path, body=body)
+
+def paged(http:Http, path:str) -> List[Dict[str,Any]]:
+    items, page = [], 1
+    while True:
+        js = http.get(path, {"page":page, "limit":100})
+        batch = js.get("results") if isinstance(js, dict) and "results" in js else js
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return items
+
+# ---------- utils ----------
+DROP = {"id","org_id","site_id","created_time","modified_time","last_modified_time"}
+def slim(x:Dict[str,Any]) -> Dict[str,Any]:
+    return {k:v for k,v in x.items() if k not in DROP}
+
+def digest(obj:Any) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",",":")).encode()).hexdigest()
+
+def by_name(lst:List[Dict[str,Any]], key:str="name") -> Dict[str,Dict[str,Any]]:
+    d={}
+    for it in lst:
+        nm = it.get(key)
+        if nm: d[nm]=it
+    return d
+
+def wlan_key(w:Dict[str,Any]) -> str:
+    return w.get("ssid") or w.get("name") or ""
+
+def endpoint_ok(http:Http, path:str) -> bool:
+    try:
+        http.get(path, {"limit":1})
+        return True
+    except Exception:
+        return False
+
+# ---------- ORG level ----------
+def export_org(http:Http, org_id:str) -> Dict[str,List[Dict[str,Any]]]:
+    out = {}
+    out["rftemplates"]      = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/rftemplates")]
+    out["networktemplates"] = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/networktemplates")]
+    out["wlans"]            = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/wlans")]
+    out["wxrules"]          = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/wxrules")]   if endpoint_ok(http, f"/api/v1/orgs/{org_id}/wxrules")   else []
+    out["wxtunnels"]        = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/wxtunnels")] if endpoint_ok(http, f"/api/v1/orgs/{org_id}/wxtunnels") else []
+    return out
+
+def import_org(http:Http, org_id:str, blob:Dict[str,List[Dict[str,Any]]]) -> List[str]:
+    rep=[]
+    # RF
+    dst_rf = by_name(paged(http, f"/api/v1/orgs/{org_id}/rftemplates"))
+    for rf in blob["rftemplates"]:
+        nm = rf.get("name","")
+        if nm in dst_rf and digest(slim(dst_rf[nm]))==digest(rf):
+            rep.append(f"org.rf: {nm} no change")
+        elif nm in dst_rf:
+            http.put(f"/api/v1/orgs/{org_id}/rftemplates/{dst_rf[nm]['id']}", rf)
+            rep.append(f"org.rf: {nm} update")
+        else:
+            http.post(f"/api/v1/orgs/{org_id}/rftemplates", rf)
+            rep.append(f"org.rf: {nm} create")
+    # Network templates
+    dst_nt = by_name(paged(http, f"/api/v1/orgs/{org_id}/networktemplates"))
+    for nt in blob["networktemplates"]:
+        nm = nt.get("name","")
+        if nm in dst_nt and digest(slim(dst_nt[nm]))==digest(nt):
+            rep.append(f"org.nettmpl: {nm} no change")
+        elif nm in dst_nt:
+            http.put(f"/api/v1/orgs/{org_id}/networktemplates/{dst_nt[nm]['id']}", nt)
+            rep.append(f"org.nettmpl: {nm} update")
+        else:
+            http.post(f"/api/v1/orgs/{org_id}/networktemplates", nt)
+            rep.append(f"org.nettmpl: {nm} create")
+    # Org WLANs
+    dst_wl = paged(http, f"/api/v1/orgs/{org_id}/wlans")
+    dst_by = {wlan_key(w): w for w in dst_wl}
+    for w in blob["wlans"]:
+        key = wlan_key(w)
+        if key in dst_by and digest(slim(dst_by[key]))==digest(w):
+            rep.append(f"org.wlan: {key} no change")
+        elif key in dst_by:
+            http.put(f"/api/v1/orgs/{org_id}/wlans/{dst_by[key]['id']}", w)
+            rep.append(f"org.wlan: {key} update")
+        else:
+            http.post(f"/api/v1/orgs/{org_id}/wlans", w)
+            rep.append(f"org.wlan: {key} create")
+    # Wx rules
+    if endpoint_ok(http, f"/api/v1/orgs/{org_id}/wxrules"):
+        dst_rules = by_name(paged(http, f"/api/v1/orgs/{org_id}/wxrules"))
+        for r in blob["wxrules"]:
+            nm = r.get("name","")
+            if nm in dst_rules and digest(slim(dst_rules[nm]))==digest(r):
+                rep.append(f"org.wxrule: {nm} no change")
+            elif nm in dst_rules:
+                http.put(f"/api/v1/orgs/{org_id}/wxrules/{dst_rules[nm]['id']}", r)
+                rep.append(f"org.wxrule: {nm} update")
+            else:
+                http.post(f"/api/v1/orgs/{org_id}/wxrules", r)
+                rep.append(f"org.wxrule: {nm or '<unnamed>'} create")
+    else:
+        rep.append("org.wxrule: endpoint not available")
+    # Wx tunnels
+    if endpoint_ok(http, f"/api/v1/orgs/{org_id}/wxtunnels"):
+        dst_tuns = by_name(paged(http, f"/api/v1/orgs/{org_id}/wxtunnels"))
+        for t in blob["wxtunnels"]:
+            nm = t.get("name","")
+            if nm in dst_tuns and digest(slim(dst_tuns[nm]))==digest(t):
+                rep.append(f"org.wxtun: {nm} no change")
+            elif nm in dst_tuns:
+                http.put(f"/api/v1/orgs/{org_id}/wxtunnels/{dst_tuns[nm]['id']}", t)
+                rep.append(f"org.wxtun: {nm} update")
+            else:
+                http.post(f"/api/v1/orgs/{org_id}/wxtunnels", t)
+                rep.append(f"org.wxtun: {nm or '<unnamed>'} create")
+    else:
+        rep.append("org.wxtun: endpoint not available")
+    return rep
+
+# ---------- SITE level ----------
+def export_site(http:Http, site_id:str) -> Dict[str,Any]:
+    blob={}
+    blob["settings"] = slim(http.get(f"/api/v1/sites/{site_id}/setting"))
+    blob["wlans"]    = [slim(x) for x in paged(http, f"/api/v1/sites/{site_id}/wlans")]
+    blob["wxrules"]  = [slim(x) for x in paged(http, f"/api/v1/sites/{site_id}/wxrules")]   if endpoint_ok(http, f"/api/v1/sites/{site_id}/wxrules")   else []
+    blob["wxtunnels"]= [slim(x) for x in paged(http, f"/api/v1/sites/{site_id}/wxtunnels")] if endpoint_ok(http, f"/api/v1/sites/{site_id}/wxtunnels") else []
+    return blob
+
+def import_site(http:Http, dst_site_id:str, blob:Dict[str,Any]) -> List[str]:
+    rep=[]
+    # settings
+    cur = slim(http.get(f"/api/v1/sites/{dst_site_id}/setting"))
+    if digest(cur)!=digest(blob["settings"]):
+        http.put(f"/api/v1/sites/{dst_site_id}/setting", blob["settings"])
+        rep.append("site.settings: update")
+    else:
+        rep.append("site.settings: no change")
+    # wlans
+    dst_wl = paged(http, f"/api/v1/sites/{dst_site_id}/wlans")
+    dst_by = {wlan_key(w): w for w in dst_wl}
+    for w in blob["wlans"]:
+        key = wlan_key(w)
+        if key in dst_by and digest(slim(dst_by[key]))==digest(w):
+            rep.append(f"site.wlan: {key} no change")
+        elif key in dst_by:
+            http.put(f"/api/v1/sites/{dst_site_id}/wlans/{dst_by[key]['id']}", w)
+            rep.append(f"site.wlan: {key} update")
+        else:
+            http.post(f"/api/v1/sites/{dst_site_id}/wlans", w)
+            rep.append(f"site.wlan: {key} create")
+    # wxrules
+    if endpoint_ok(http, f"/api/v1/sites/{dst_site_id}/wxrules"):
+        dst_rules = by_name(paged(http, f"/api/v1/sites/{dst_site_id}/wxrules"))
+        for r in blob["wxrules"]:
+            nm = r.get("name","")
+            if nm in dst_rules and digest(slim(dst_rules[nm]))==digest(r):
+                rep.append(f"site.wxrule: {nm} no change")
+            elif nm in dst_rules:
+                http.put(f"/api/v1/sites/{dst_site_id}/wxrules/{dst_rules[nm]['id']}", r)
+                rep.append(f"site.wxrule: {nm} update")
+            else:
+                http.post(f"/api/v1/sites/{dst_site_id}/wxrules", r)
+                rep.append(f"site.wxrule: {nm or '<unnamed>'} create")
+    else:
+        rep.append("site.wxrule: endpoint not available")
+    # wxtunnels
+    if endpoint_ok(http, f"/api/v1/sites/{dst_site_id}/wxtunnels"):
+        dst_tuns = by_name(paged(http, f"/api/v1/sites/{dst_site_id}/wxtunnels"))
+        for t in blob["wxtunnels"]:
+            nm = t.get("name","")
+            if nm in dst_tuns and digest(slim(dst_tuns[nm]))==digest(t):
+                rep.append(f"site.wxtunnel: {nm} no change")
+            elif nm in dst_tuns:
+                http.put(f"/api/v1/sites/{dst_site_id}/wxtunnels/{dst_tuns[nm]['id']}", t)
+                rep.append(f"site.wxtunnel: {nm} update")
+            else:
+                http.post(f"/api/v1/sites/{dst_site_id}/wxtunnels", t)
+                rep.append(f"site.wxtunnel: {nm or '<unnamed>'} create")
+    else:
+        rep.append("site.wxtunnel: endpoint not available")
+    return rep
+
+# ---------- site helpers ----------
+def list_sites(http:Http, org_id:str) -> List[Dict[str,Any]]:
+    return paged(http, f"/api/v1/orgs/{org_id}/sites")
+
+def get_or_create_site_by_name(http:Http, org_id:str, name:str) -> str:
+    for s in list_sites(http, org_id):
+        if s.get("name")==name:
+            return s["id"]
+    created = http.post(f"/api/v1/orgs/{org_id}/sites", {"name": name})
+    return created["id"]
+
+# ---------- main ----------
+def main():
+    for var, val in [
+        ("API_HOST", API_HOST), ("TOKEN_SRC", TOKEN_SRC), ("TOKEN_DST", TOKEN_DST),
+        ("SRC_ORG_ID", SRC_ORG_ID), ("DST_ORG_ID", DST_ORG_ID)
+    ]:
+        if not val or "PUT_" in str(val):
+            sys.stderr.write(f"Set {var} at the top of the script.\n"); sys.exit(2)
+
+    src = Http(API_HOST, TOKEN_SRC)
+    dst = Http(API_HOST, TOKEN_DST)
+
+    if COPY_MODE in ("org-only","org-and-sites"):
+        print("Exporting org objects from source...")
+        org_blob = export_org(src, SRC_ORG_ID)
+        print("Importing org objects to destination...")
+        rep = import_org(dst, DST_ORG_ID, org_blob)
+        for line in rep: print(" -", line)
+
+    if COPY_MODE in ("sites-only","org-and-sites"):
+        if SRC_SITE_ID and DST_SITE_ID:
+            print(f"Copy single site: {SRC_SITE_ID} -> {DST_SITE_ID}")
+            blob = export_site(src, SRC_SITE_ID)
+            rep = import_site(dst, DST_SITE_ID, blob)
+            for line in rep: print(" -", line)
+            return
+
+        src_sites = list_sites(src, SRC_ORG_ID)
+        if LIMIT_SITE_NAMES:
+            want = set(n.strip() for n in LIMIT_SITE_NAMES if n.strip())
+            src_sites = [s for s in src_sites if s.get("name") in want]
+            if not src_sites:
+                print("No matching sites in source org for LIMIT_SITE_NAMES.")
+                return
+
+        dst_sites_by_name = by_name(list_sites(dst, DST_ORG_ID))
+        for s_src in src_sites:
+            nm = s_src.get("name","")
+            if not nm:
+                print(f"Skipping unnamed site id={s_src.get('id')}")
+                continue
+            print(f"\nProcessing site: {nm}")
+            dst_site_id = dst_sites_by_name.get(nm, {}).get("id") or get_or_create_site_by_name(dst, DST_ORG_ID, nm)
+            blob = export_site(src, s_src["id"])
+            rep = import_site(dst, dst_site_id, blob)
+            for line in rep: print(" -", line)
+
+if __name__ == "__main__":
+    main()
