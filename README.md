@@ -17,6 +17,8 @@ Org-level
 - WxLAN Rules
 - WxLAN Tunnels
 - Org Webhooks
+- Inventory
+- MPSK Users
 
 Site-level (for each site)
 - Site (auto-create by name if missing)
@@ -32,10 +34,8 @@ Everything above is round-tripped with field filtering (id, timestamps, etc.) so
 What it does NOT copy
 ---------------------------------
 
-- Inventory / device claims (you must unclaim/claim between orgs)
-- Users, roles, SSO/SAML, API tokens
 - Floorplans/maps/zones/images (API doesn’t provide a clean export+import pair)
-- Secrets: PPSK passphrases, OAuth secrets, private keys
+- Secrets: OAuth secrets, private keys
 - Historical analytics/SLE/metrics
 
 ---------------------------------
