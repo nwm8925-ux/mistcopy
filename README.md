@@ -167,10 +167,10 @@ FAQ
 ---------------------------------
 
 Can it copy PPSKs?
-- Not the secrets. You can import your own CSV/JSON of PPSKs to the destination org/sites afterward.
+- Yes it can!
 
 Can it copy floorplans?
-- Not end-to-end. The public API doesn’t give a supported “download image → upload image” flow. You can export map metadata separately.
+- Not end-to-end. The public API doesn’t give a supported “download image → upload image” flow. You can export map metadata separately. V2 is slowly adding support for this, however. 
 
 Does it require a VPN or inbound ports?
 - No. It talks to the Mist API over HTTPS from wherever you run it.
