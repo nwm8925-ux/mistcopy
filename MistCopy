@@ -1,343 +1,2320 @@
 #!/usr/bin/env python3
 """
-Mist full clone (org + sites) — single file, no third-party packages. No deletes. Idempotent upserts.
+Juniper Mist Full API Clone Tool - Comprehensive Configuration Migration
 
-Quick start (macOS):
-  chmod +x mist_full_clone_single.py
-  ./mist_full_clone_single.py
+This script provides complete coverage of the Juniper Mist API for cloning/migrating
+configurations between organizations and sites. Based on the official Mist API documentation.
 
-What it does:
-  - Org: RF templates, network templates, org WLANs, Wx rules, Wx tunnels
-  - Sites: creates missing sites by name, copies site settings, site WLANs, site Wx rules, site Wx tunnels
-  - Safe: upsert by name/SSID, retries on 429/5xx
-  - Excludes: inventory claims, users/roles/SSO, webhooks, analytics, floorplans, PPSK plaintext
+Supported Resources:
+  ORGANIZATION LEVEL:
+    - Sites, Site Groups
+    - RF Templates, Network Templates, AP Templates, Gateway Templates
+    - Org WLANs, Org PSKs, PSK Portals
+    - WxLAN Rules, WxLAN Tags, WxLAN Tunnels
+    - Networks, Services, Service Policies, Security Policies
+    - VPNs, EVPN Topologies
+    - Device Profiles (AP, Switch, Gateway)
+    - Alarm Templates
+    - Asset Filters, Org Assets
+    - Mist Edge, Mist Edge Clusters
+    - NAC Rules, NAC Tags, IDP Profiles
+    - Webhooks
+    - SDK Templates
+    - WLAN Templates (full template objects)
+    
+  SITE LEVEL:
+    - Site Settings
+    - Site WLANs, Site PSKs
+    - Maps (floorplans) - metadata only, images require separate handling
+    - Zones, RSSI Zones
+    - Virtual Beacons, Beacons
+    - Assets, Asset Filters
+    - WxLAN Rules, WxLAN Tunnels, WxLAN Tags
+    - Networks, Services, Service Policies
+    - Webhooks
+    - Mist Edge (site-level), Mx Tunnels
+    - EVPN Topologies
+    - HA Clusters
+    - Virtual Chassis configurations
 
-If you hit SSL errors on macOS:
-  - Run “Install Certificates.command” from the Python 3.x folder in Applications, or
-  - Set CA_BUNDLE_PATH to a PEM file, or
-  - As a last resort set INSECURE_SSL=True (not recommended).
+  MSP LEVEL (if applicable):
+    - MSP configuration
+    - Org Groups
+    - License management
+
+Features:
+  - Safe idempotent upserts (no deletes unless explicitly enabled)
+  - Retries on 429/5xx errors with exponential backoff
+  - Cross-region support (different API hosts for src/dst)
+  - Dry-run mode for testing
+  - Selective copy by resource type
+  - JSON export/import for offline transfers
+  - Detailed logging and progress reporting
+
+Quick start:
+  1. Edit the configuration section below
+  2. chmod +x MistFullClone.py
+  3. ./MistFullClone.py
+
+API Reference: https://api.mist.com/api/v1/docs/
+Rate Limit: 5000 calls/hour per token
 """
 
-# ---------- EDIT THESE ----------
-API_HOST      = "https://api.ac2.mist.com"  # keep https and correct region
-TOKEN_SRC     = ""
-TOKEN_DST     = ""
-SRC_ORG_ID    = ""
-DST_ORG_ID    = ""
-COPY_MODE     = "org-and-sites"  # "org-only", "sites-only", "org-and-sites"
+# ============================================================================
+# CONFIGURATION - EDIT THESE VALUES
+# ============================================================================
 
-# Limit sites by exact name. Leave empty to copy all sites by name.
-LIMIT_SITE_NAMES = []  # e.g. ["Home A", "Home B"]
+# API Hosts - Use correct regional endpoint
+# Global 01: api.mist.com | Global 02: api.gc1.mist.com
+# Global 03: api.ac2.mist.com | Global 04: api.gc2.mist.com
+# EU: api.eu.mist.com
+API_HOST_SRC = "https://api.ac2.mist.com"
+API_HOST_DST = "https://api.ac2.mist.com"  # Can differ from source for cross-region
 
-# Single-site direct copy by ID (overrides LIMIT_SITE_NAMES when both set)
-SRC_SITE_ID = ""  # e.g. "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-DST_SITE_ID = ""  # e.g. "ffffffff-1111-2222-3333-444444444444"
+# API Tokens (create at {api-host}/api/v1/self/apitokens)
+TOKEN_SRC = ""  # Source organization token
+TOKEN_DST = ""  # Destination organization token
 
-# SSL options
-CA_BUNDLE_PATH = ""     # e.g. "/Library/Frameworks/Python.framework/Versions/3.13/etc/openssl/cert.pem"
-INSECURE_SSL   = True  # True = disable certificate verification (last resort, not recommended)
-# --------------------------------
+# Organization IDs
+SRC_ORG_ID = ""  # Source org UUID
+DST_ORG_ID = ""  # Destination org UUID
 
-import sys, time, json, hashlib, urllib.request, urllib.parse, ssl
-from typing import Any, Dict, List, Optional
+# Copy Mode
+COPY_MODE = "full"  # Options: "full", "org-only", "sites-only", "selective"
 
-# ---------- HTTP (urllib, no requests) ----------
-class Http:
-    def __init__(self, base:str, token:str):
+# Selective copy - only used when COPY_MODE = "selective"
+# Set to True for resources you want to copy
+COPY_RESOURCES = {
+    # Organization level
+    "org_settings": False,
+    "sites": True,
+    "sitegroups": True,
+    "rftemplates": True,
+    "aptemplates": True,
+    "networktemplates": True,
+    "gatewaytemplates": True,
+    "templates": True,  # WLAN templates
+    "org_wlans": True,
+    "org_psks": True,
+    "pskportals": True,
+    "wxrules": True,
+    "wxtags": True,
+    "wxtunnels": True,
+    "networks": True,
+    "services": True,
+    "servicepolicies": True,
+    "secpolicies": True,
+    "vpns": True,
+    "evpn_topologies": True,
+    "deviceprofiles": True,  # AP profiles
+    "deviceprofiles_gateway": True,
+    "alarmtemplates": True,
+    "assetfilters": True,
+    "org_assets": True,
+    "mxedges": False,  # Mist Edge - careful with hardware
+    "mxclusters": False,
+    "nacrules": True,
+    "nactags": True,
+    "idpprofiles": True,
+    "webhooks": False,  # Usually environment-specific
+    "sdktemplates": True,
+    # Site level
+    "site_settings": True,
+    "site_wlans": True,
+    "site_psks": True,
+    "maps": True,  # Metadata only
+    "map_images": True,  # Floorplan images (binary)
+    "zones": True,
+    "rssizones": True,
+    "vbeacons": True,
+    "beacons": True,
+    "site_assets": True,
+    "site_assetfilters": True,
+    "site_wxrules": True,
+    "site_wxtunnels": True,
+    "site_wxtags": True,
+    "site_networks": True,
+    "site_services": True,
+    "site_servicepolicies": True,
+    "site_webhooks": False,
+    "site_mxedges": False,
+    "mxtunnels": True,
+    "site_evpn_topologies": True,
+    "haclusters": True,
+    "vcs": True,  # Virtual Chassis
+    # Captive Portal assets
+    "portal_images": True,  # WLAN portal logo/background images
+    "portal_templates": True,  # WLAN portal HTML templates
+    # Inventory/Devices
+    "inventory": False,  # Device inventory (APs, switches, gateways)
+    "device_placement": True,  # AP placement on maps (x, y, height, orientation)
+}
+
+# Device claim codes - map MAC address to claim code for devices you want to migrate
+# Get claim codes from source org inventory (the 'magic' field) or from device labels
+# Example: {"5c5b35ae890d": "MAEGXREBCNJ2V9Z", "5c5b35ae890e": "ABCDEFGHIJKLMNO"}
+DEVICE_CLAIM_CODES = {}
+
+# Comma-separated list of MAC addresses to migrate (leave empty to migrate all)
+# Example: "5c5b35ae890d,5c5b35ae890e,5c5b35ae890f"
+DEVICE_MACS_TO_MIGRATE = ""
+
+# Auto-release devices from source org before claiming to destination
+# WARNING: This will unclaim devices from source! Set to True only if you're sure.
+AUTO_RELEASE_FROM_SOURCE = False
+
+# Interactive mode - prompt user for confirmation before releasing/claiming devices
+INTERACTIVE_MODE = True
+
+# Site filters
+LIMIT_SITE_NAMES = []  # Empty = all sites, or ["Site A", "Site B"]
+SRC_SITE_ID = ""  # For single site copy
+DST_SITE_ID = ""  # For single site copy
+
+# Options
+DRY_RUN = False  # Set True to preview without making changes
+ALLOW_DELETE = False  # Set True to enable deletion of objects not in source
+EXPORT_JSON = False  # Export to JSON file instead of direct copy
+IMPORT_JSON = ""  # Path to JSON file to import (overrides source API)
+VERBOSE = True  # Detailed logging
+
+# SSL Options
+CA_BUNDLE_PATH = ""  # Path to CA bundle if needed
+INSECURE_SSL = True  # Disable SSL verification (not recommended for production)
+
+# ============================================================================
+# END CONFIGURATION
+# ============================================================================
+
+import sys
+import time
+import json
+import hashlib
+import urllib.request
+import urllib.parse
+import ssl
+import os
+from typing import Any, Dict, List, Optional, Tuple, Set
+from datetime import datetime
+
+# ============================================================================
+# HTTP Client
+# ============================================================================
+
+class MistApi:
+    """HTTP client for Mist API with retry logic and rate limiting."""
+    
+    def __init__(self, base: str, token: str, name: str = "api"):
         self.base = base.rstrip("/")
         self.token = token
+        self.name = name
+        self.call_count = 0
+        
         # Build SSL context
         if INSECURE_SSL:
             self.ctx = ssl._create_unverified_context()
+        elif CA_BUNDLE_PATH:
+            self.ctx = ssl.create_default_context(cafile=CA_BUNDLE_PATH)
         else:
-            if CA_BUNDLE_PATH:
-                self.ctx = ssl.create_default_context(cafile=CA_BUNDLE_PATH)
-            else:
-                self.ctx = ssl.create_default_context()
-
-    def call(self, method:str, path:str, params:Optional[Dict[str,Any]]=None,
-             body:Optional[Dict[str,Any]]=None, retries:int=6) -> Any:
+            self.ctx = ssl.create_default_context()
+    
+    def call(self, method: str, path: str, params: Optional[Dict[str, Any]] = None,
+             body: Optional[Dict[str, Any]] = None, retries: int = 6) -> Any:
+        """Make an API call with retry logic."""
         url = self.base + path
         if params:
             q = urllib.parse.urlencode(params, doseq=True)
             url = url + ("?" + q)
+        
         data = None
         headers = {
             "Authorization": f"Token {self.token}",
             "Content-Type": "application/json",
         }
+        
         if body is not None:
-            data = json.dumps(body, separators=(",",":")).encode("utf-8")
-        for attempt in range(retries+1):
+            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        
+        for attempt in range(retries + 1):
             req = urllib.request.Request(url, data=data, method=method, headers=headers)
             try:
-                with urllib.request.urlopen(req, context=self.ctx, timeout=45) as r:
+                self.call_count += 1
+                with urllib.request.urlopen(req, context=self.ctx, timeout=60) as r:
                     b = r.read()
                     return json.loads(b.decode("utf-8") or "null") if b else None
             except urllib.error.HTTPError as e:
                 code = e.getcode()
                 if code in (429, 502, 503, 504) and attempt < retries:
-                    time.sleep(1.2 * (attempt+1))
+                    wait = 1.5 * (attempt + 1)
+                    if code == 429:
+                        wait = 5.0 * (attempt + 1)  # Longer wait for rate limit
+                    log(f"  [{self.name}] {method} {path} -> {code}, retry in {wait}s...")
+                    time.sleep(wait)
                     continue
                 try:
-                    err_body = e.read().decode("utf-8")[:600]
+                    err_body = e.read().decode("utf-8")[:800]
                 except Exception:
                     err_body = ""
                 raise RuntimeError(f"{method} {path} -> {code} {err_body}")
             except urllib.error.URLError as e:
                 if attempt < retries:
-                    time.sleep(1.0 * (attempt+1))
+                    time.sleep(1.0 * (attempt + 1))
                     continue
                 raise
-
-    def get(self, path:str, params:Optional[Dict[str,Any]]=None):
+        return None
+    
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         return self.call("GET", path, params=params)
-
-    def post(self, path:str, body:Dict[str,Any]):
+    
+    def post(self, path: str, body: Dict[str, Any]) -> Any:
         return self.call("POST", path, body=body)
-
-    def put(self, path:str, body:Dict[str,Any]):
+    
+    def put(self, path: str, body: Dict[str, Any]) -> Any:
         return self.call("PUT", path, body=body)
+    
+    def delete(self, path: str) -> Any:
+        return self.call("DELETE", path)
+    
+    def upload_file(self, path: str, file_data: bytes, filename: str, 
+                    content_type: str = "image/png") -> Any:
+        """Upload a file using multipart/form-data."""
+        url = self.base + path
+        boundary = f"----MistCloneBoundary{int(time.time()*1000)}"
+        
+        # Build multipart body
+        body = []
+        body.append(f"--{boundary}".encode())
+        body.append(f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode())
+        body.append(f"Content-Type: {content_type}".encode())
+        body.append(b"")
+        body.append(file_data)
+        body.append(f"--{boundary}--".encode())
+        body.append(b"")
+        
+        data = b"\r\n".join(body)
+        
+        headers = {
+            "Authorization": f"Token {self.token}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+        
+        req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+        try:
+            self.call_count += 1
+            with urllib.request.urlopen(req, context=self.ctx, timeout=120) as r:
+                b = r.read()
+                return json.loads(b.decode("utf-8") or "null") if b else None
+        except urllib.error.HTTPError as e:
+            code = e.getcode()
+            try:
+                err_body = e.read().decode("utf-8")[:600]
+            except Exception:
+                err_body = ""
+            raise RuntimeError(f"POST {path} (upload) -> {code} {err_body}")
+    
+    def get_binary(self, path: str) -> Optional[bytes]:
+        """Download binary content (images, etc.)."""
+        url = self.base + path
+        headers = {
+            "Authorization": f"Token {self.token}",
+        }
+        
+        req = urllib.request.Request(url, method="GET", headers=headers)
+        try:
+            self.call_count += 1
+            with urllib.request.urlopen(req, context=self.ctx, timeout=60) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.getcode() == 404:
+                return None
+            raise
 
-def paged(http:Http, path:str) -> List[Dict[str,Any]]:
-    items, page = [], 1
+
+def paged(api: MistApi, path: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """Fetch all pages from a paginated endpoint."""
+    items = []
+    page = 1
     while True:
-        js = http.get(path, {"page":page, "limit":100})
-        batch = js.get("results") if isinstance(js, dict) and "results" in js else js
+        js = api.get(path, {"page": page, "limit": limit})
+        # Handle different response formats
+        if isinstance(js, dict):
+            batch = js.get("results") or js.get("items") or []
+        elif isinstance(js, list):
+            batch = js
+        else:
+            break
+        
         if not batch:
             break
         items.extend(batch)
-        if len(batch) < 100:
+        if len(batch) < limit:
             break
         page += 1
     return items
 
-# ---------- utils ----------
-DROP = {"id","org_id","site_id","created_time","modified_time","last_modified_time"}
-def slim(x:Dict[str,Any]) -> Dict[str,Any]:
-    return {k:v for k,v in x.items() if k not in DROP}
 
-def digest(obj:Any) -> str:
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",",":")).encode()).hexdigest()
-
-def by_name(lst:List[Dict[str,Any]], key:str="name") -> Dict[str,Dict[str,Any]]:
-    d={}
-    for it in lst:
-        nm = it.get(key)
-        if nm: d[nm]=it
-    return d
-
-def wlan_key(w:Dict[str,Any]) -> str:
-    return w.get("ssid") or w.get("name") or ""
-
-def endpoint_ok(http:Http, path:str) -> bool:
+def endpoint_ok(api: MistApi, path: str) -> bool:
+    """Check if an endpoint is accessible."""
     try:
-        http.get(path, {"limit":1})
+        api.get(path, {"limit": 1})
         return True
     except Exception:
         return False
 
-# ---------- ORG level ----------
-def export_org(http:Http, org_id:str) -> Dict[str,List[Dict[str,Any]]]:
-    out = {}
-    out["rftemplates"]      = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/rftemplates")]
-    out["networktemplates"] = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/networktemplates")]
-    out["wlans"]            = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/wlans")]
-    out["wxrules"]          = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/wxrules")]   if endpoint_ok(http, f"/api/v1/orgs/{org_id}/wxrules")   else []
-    out["wxtunnels"]        = [slim(x) for x in paged(http, f"/api/v1/orgs/{org_id}/wxtunnels")] if endpoint_ok(http, f"/api/v1/orgs/{org_id}/wxtunnels") else []
-    return out
 
-def import_org(http:Http, org_id:str, blob:Dict[str,List[Dict[str,Any]]]) -> List[str]:
-    rep=[]
-    # RF
-    dst_rf = by_name(paged(http, f"/api/v1/orgs/{org_id}/rftemplates"))
-    for rf in blob["rftemplates"]:
-        nm = rf.get("name","")
-        if nm in dst_rf and digest(slim(dst_rf[nm]))==digest(rf):
-            rep.append(f"org.rf: {nm} no change")
-        elif nm in dst_rf:
-            http.put(f"/api/v1/orgs/{org_id}/rftemplates/{dst_rf[nm]['id']}", rf)
-            rep.append(f"org.rf: {nm} update")
+# ============================================================================
+# Utilities
+# ============================================================================
+
+# Fields to strip when comparing/copying objects
+DROP_FIELDS = {
+    "id", "org_id", "site_id", "created_time", "modified_time", 
+    "last_modified_time", "for_site", "msp_id"
+}
+
+# Additional fields that reference IDs and may need mapping
+ID_REFERENCE_FIELDS = {
+    "rftemplate_id", "networktemplate_id", "aptemplate_id", "gatewaytemplate_id",
+    "template_id", "sitegroup_ids", "map_id", "zone_id", "wxtunnel_id",
+    "deviceprofile_id", "alarmtemplate_id", "mxcluster_id", "mxedge_id",
+    "wlan_id", "wxtag_ids", "apply_tags", "except_tags"
+}
+
+
+def log(msg: str):
+    """Print log message if verbose mode is enabled."""
+    if VERBOSE:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+
+def slim(obj: Dict[str, Any], extra_drop: Set[str] = None) -> Dict[str, Any]:
+    """Remove system fields from an object for comparison/copying."""
+    drop = DROP_FIELDS | (extra_drop or set())
+    return {k: v for k, v in obj.items() if k not in drop}
+
+
+def digest(obj: Any) -> str:
+    """Generate a hash digest of an object for comparison."""
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def by_key(lst: List[Dict[str, Any]], key: str = "name") -> Dict[str, Dict[str, Any]]:
+    """Index a list of objects by a key field."""
+    d = {}
+    for item in lst:
+        k = item.get(key)
+        if k:
+            d[k] = item
+    return d
+
+
+def wlan_key(w: Dict[str, Any]) -> str:
+    """Get unique key for a WLAN (SSID or name)."""
+    return w.get("ssid") or w.get("name") or ""
+
+
+def safe_get(api: MistApi, path: str, default: Any = None) -> Any:
+    """Safely get from an endpoint, returning default on error."""
+    try:
+        return api.get(path)
+    except Exception as e:
+        log(f"  Warning: {path} -> {e}")
+        return default
+
+
+def safe_paged(api: MistApi, path: str) -> List[Dict[str, Any]]:
+    """Safely get paginated results, returning empty list on error."""
+    try:
+        return paged(api, path)
+    except Exception as e:
+        log(f"  Warning: {path} -> {e}")
+        return []
+
+
+# ============================================================================
+# ID Mapping for Cross-Reference Resolution
+# ============================================================================
+
+class IdMapper:
+    """Track ID mappings between source and destination for reference resolution."""
+    
+    def __init__(self):
+        self.maps: Dict[str, Dict[str, str]] = {
+            "sites": {},
+            "rftemplates": {},
+            "networktemplates": {},
+            "aptemplates": {},
+            "gatewaytemplates": {},
+            "templates": {},
+            "sitegroups": {},
+            "deviceprofiles": {},
+            "deviceprofiles_gateway": {},
+            "alarmtemplates": {},
+            "mxclusters": {},
+            "mxedges": {},
+            "wxtunnels": {},
+            "wxtags": {},
+            "maps": {},
+            "zones": {},
+            "networks": {},
+            "services": {},
+        }
+    
+    def add(self, resource_type: str, src_id: str, dst_id: str):
+        """Add a mapping from source ID to destination ID."""
+        if resource_type in self.maps and src_id and dst_id:
+            self.maps[resource_type][src_id] = dst_id
+    
+    def get(self, resource_type: str, src_id: str) -> Optional[str]:
+        """Get destination ID for a source ID."""
+        return self.maps.get(resource_type, {}).get(src_id)
+    
+    def remap_object(self, obj: Dict[str, Any]) -> Dict[str, Any]:
+        """Remap ID references in an object to destination IDs."""
+        result = obj.copy()
+        
+        # Single ID fields
+        field_mapping = {
+            "rftemplate_id": "rftemplates",
+            "networktemplate_id": "networktemplates",
+            "aptemplate_id": "aptemplates",
+            "gatewaytemplate_id": "gatewaytemplates",
+            "template_id": "templates",
+            "deviceprofile_id": "deviceprofiles",
+            "alarmtemplate_id": "alarmtemplates",
+            "mxcluster_id": "mxclusters",
+            "mxedge_id": "mxedges",
+            "wxtunnel_id": "wxtunnels",
+            "map_id": "maps",
+            "zone_id": "zones",
+        }
+        
+        for field, resource_type in field_mapping.items():
+            if field in result and result[field]:
+                new_id = self.get(resource_type, result[field])
+                if new_id:
+                    result[field] = new_id
+        
+        # List ID fields
+        list_field_mapping = {
+            "sitegroup_ids": "sitegroups",
+            "wxtag_ids": "wxtags",
+            "apply_tags": "wxtags",
+            "except_tags": "wxtags",
+        }
+        
+        for field, resource_type in list_field_mapping.items():
+            if field in result and result[field]:
+                result[field] = [
+                    self.get(resource_type, id_) or id_
+                    for id_ in result[field]
+                ]
+        
+        return result
+
+
+# ============================================================================
+# Inventory and Device Migration Functions
+# ============================================================================
+
+def export_inventory(api: MistApi, org_id: str) -> Dict[str, Any]:
+    """
+    Export inventory with device details and claim codes.
+    The 'magic' field contains the claim code needed for re-claiming.
+    """
+    inventory = {}
+    
+    try:
+        # Get full inventory - includes 'magic' (claim code) for each device
+        devices = paged(api, f"/api/v1/orgs/{org_id}/inventory")
+        
+        # Organize by type
+        inventory["aps"] = []
+        inventory["switches"] = []
+        inventory["gateways"] = []
+        inventory["mxedges"] = []
+        
+        for device in devices:
+            device_type = device.get("type", "ap")
+            entry = {
+                "mac": device.get("mac"),
+                "serial": device.get("serial"),
+                "model": device.get("model"),
+                "name": device.get("name"),
+                "site_id": device.get("site_id"),
+                "site_name": device.get("site_name"),
+                "magic": device.get("magic"),  # Claim code!
+                "deviceprofile_id": device.get("deviceprofile_id"),
+                # AP placement info
+                "map_id": device.get("map_id"),
+                "x": device.get("x"),
+                "y": device.get("y"),
+                "height": device.get("height"),
+                "orientation": device.get("orientation"),
+                "notes": device.get("notes"),
+            }
+            
+            if device_type == "ap":
+                inventory["aps"].append(entry)
+            elif device_type == "switch":
+                inventory["switches"].append(entry)
+            elif device_type == "gateway":
+                inventory["gateways"].append(entry)
+            elif device_type == "mxedge":
+                inventory["mxedges"].append(entry)
+        
+        log(f"  Inventory: {len(inventory['aps'])} APs, {len(inventory['switches'])} switches, "
+            f"{len(inventory['gateways'])} gateways")
+        
+    except Exception as e:
+        log(f"  Warning: Could not export inventory - {e}")
+    
+    return inventory
+
+
+def release_devices_from_org(api: MistApi, org_id: str, macs: List[str]) -> Tuple[bool, str]:
+    """
+    Release (unclaim) devices from an organization.
+    Devices must be released before they can be claimed to another org.
+    
+    Returns:
+        Tuple of (success, message)
+    """
+    if not macs:
+        return True, "No devices to release"
+    
+    try:
+        # Release uses PUT with op="delete"
+        result = api.put(f"/api/v1/orgs/{org_id}/inventory", {
+            "op": "delete",
+            "macs": macs
+        })
+        return True, f"Released {len(macs)} devices"
+    except Exception as e:
+        return False, f"Release failed: {e}"
+
+
+def claim_devices_to_org(api: MistApi, org_id: str, claim_codes: List[str]) -> Tuple[bool, str, Dict]:
+    """
+    Claim devices to an organization using claim codes.
+    
+    Returns:
+        Tuple of (success, message, result_dict)
+    """
+    if not claim_codes:
+        return True, "No devices to claim", {}
+    
+    try:
+        result = api.post(f"/api/v1/orgs/{org_id}/inventory", claim_codes)
+        
+        added = result.get("added", []) if result else []
+        duplicated = result.get("duplicated", [])
+        errors = result.get("error", [])
+        reasons = result.get("reason", [])
+        
+        if errors:
+            error_details = ", ".join(f"{e}: {r}" for e, r in zip(errors, reasons))
+            return False, f"Claim errors: {error_details}", result
+        
+        return True, f"Claimed {len(added)} devices ({len(duplicated)} already present)", result
+        
+    except Exception as e:
+        return False, f"Claim failed: {e}", {}
+
+
+def interactive_inventory_migration(src_api: MistApi, dst_api: MistApi, 
+                                     src_org_id: str, dst_org_id: str,
+                                     inventory: Dict[str, Any], 
+                                     mapper: IdMapper) -> List[str]:
+    """
+    Interactive inventory migration with user prompts.
+    
+    Flow:
+    1. Show devices and their claim codes
+    2. Ask user which devices to migrate (or use DEVICE_MACS_TO_MIGRATE)
+    3. Optionally allow user to enter claim codes manually
+    4. Release from source org (with confirmation)
+    5. Claim to destination org
+    6. Assign to sites and place on maps
+    """
+    report = []
+    
+    # Combine all device types
+    all_devices = (
+        inventory.get("aps", []) + 
+        inventory.get("switches", []) + 
+        inventory.get("gateways", [])
+    )
+    
+    if not all_devices:
+        log("  No devices in inventory to migrate")
+        return report
+    
+    # Filter devices if DEVICE_MACS_TO_MIGRATE is specified
+    if DEVICE_MACS_TO_MIGRATE.strip():
+        wanted_macs = set(m.strip().lower().replace(":", "").replace("-", "") 
+                         for m in DEVICE_MACS_TO_MIGRATE.split(",") if m.strip())
+        all_devices = [d for d in all_devices 
+                       if d.get("mac", "").lower().replace(":", "") in wanted_macs]
+        log(f"  Filtered to {len(all_devices)} devices based on DEVICE_MACS_TO_MIGRATE")
+    
+    if not all_devices:
+        log("  No matching devices found")
+        return report
+    
+    # Build working claim codes dict (start with config, add from inventory)
+    working_claim_codes = dict(DEVICE_CLAIM_CODES)
+    for device in all_devices:
+        mac = device.get("mac", "")
+        if mac and device.get("magic") and mac not in working_claim_codes:
+            working_claim_codes[mac] = device.get("magic")
+    
+    # Display devices and claim codes
+    print("\n" + "=" * 70)
+    print("DEVICE INVENTORY - CLAIM CODES")
+    print("=" * 70)
+    print(f"{'#':<4} {'MAC Address':<18} {'Model':<15} {'Name':<20} {'Claim Code':<20}")
+    print("-" * 70)
+    
+    devices_missing_codes = []
+    for i, device in enumerate(all_devices, 1):
+        mac = device.get("mac", "")
+        model = device.get("model", "")[:15]
+        name = (device.get("name") or "")[:20]
+        magic = working_claim_codes.get(mac, "")
+        
+        status = "" if magic else " <-- MISSING"
+        print(f"{i:<4} {mac:<18} {model:<15} {name:<20} {magic:<20}{status}")
+        
+        if not magic:
+            devices_missing_codes.append(mac)
+    
+    print("-" * 70)
+    print(f"Total: {len(all_devices)} devices")
+    if devices_missing_codes:
+        print(f"Missing claim codes: {len(devices_missing_codes)}")
+    print("=" * 70)
+    
+    # If any devices are missing claim codes, offer to enter them
+    if devices_missing_codes and not DRY_RUN:
+        print("\nSome devices are missing claim codes.")
+        print("You can find claim codes on the physical device label or in Mist Portal")
+        print("  (Organization > Inventory > click device > 'Claim Code' field)")
+        print("")
+        response = input("Enter claim codes now? (yes/no/skip): ").strip().lower()
+        
+        if response in ("yes", "y"):
+            print("\nEnter claim codes (comma-separated) in format: MAC=CODE,MAC=CODE")
+            print("Example: 5c5b35ae890d=MAEGXREBCNJ2V9Z,5c5b35ae890e=ABCDEFGHIJKLMNO")
+            print("Or just enter codes in order matching device list above.")
+            print("")
+            
+            codes_input = input("Claim codes: ").strip()
+            
+            if codes_input:
+                # Parse input - either MAC=CODE format or just codes in order
+                if "=" in codes_input:
+                    # MAC=CODE format
+                    for pair in codes_input.split(","):
+                        pair = pair.strip()
+                        if "=" in pair:
+                            mac, code = pair.split("=", 1)
+                            mac = mac.strip().lower().replace(":", "").replace("-", "")
+                            code = code.strip().upper()
+                            if mac and code:
+                                # Find device with this MAC
+                                for d in all_devices:
+                                    if d.get("mac", "").lower().replace(":", "") == mac:
+                                        working_claim_codes[d.get("mac")] = code
+                                        break
+                else:
+                    # Just codes in order - apply to missing devices
+                    codes = [c.strip().upper() for c in codes_input.split(",") if c.strip()]
+                    for mac, code in zip(devices_missing_codes, codes):
+                        working_claim_codes[mac] = code
+            
+            # Refresh display
+            print("\nUpdated claim codes:")
+            print("-" * 70)
+            for device in all_devices:
+                mac = device.get("mac", "")
+                code = working_claim_codes.get(mac, "MISSING")
+                print(f"  {mac}: {code}")
+            print("-" * 70)
+        
+        elif response == "skip":
+            # Only process devices that have codes
+            all_devices = [d for d in all_devices if working_claim_codes.get(d.get("mac"))]
+            print(f"Proceeding with {len(all_devices)} devices that have claim codes")
+    
+    # Build final list of devices with codes
+    devices_with_codes = []
+    for device in all_devices:
+        mac = device.get("mac", "")
+        code = working_claim_codes.get(mac)
+        if code:
+            devices_with_codes.append({**device, "magic": code})
         else:
-            http.post(f"/api/v1/orgs/{org_id}/rftemplates", rf)
-            rep.append(f"org.rf: {nm} create")
-    # Network templates
-    dst_nt = by_name(paged(http, f"/api/v1/orgs/{org_id}/networktemplates"))
-    for nt in blob["networktemplates"]:
-        nm = nt.get("name","")
-        if nm in dst_nt and digest(slim(dst_nt[nm]))==digest(nt):
-            rep.append(f"org.nettmpl: {nm} no change")
-        elif nm in dst_nt:
-            http.put(f"/api/v1/orgs/{org_id}/networktemplates/{dst_nt[nm]['id']}", nt)
-            rep.append(f"org.nettmpl: {nm} update")
+            report.append(f"inventory: {mac} has no claim code - skipped")
+    
+    if not devices_with_codes:
+        log("  No devices have claim codes available")
+        return report
+    
+    # Check if devices are already in destination
+    try:
+        dst_inventory = paged(dst_api, f"/api/v1/orgs/{dst_org_id}/inventory")
+        dst_macs = {d.get("mac") for d in dst_inventory}
+    except Exception:
+        dst_macs = set()
+    
+    devices_to_migrate = [d for d in devices_with_codes if d.get("mac") not in dst_macs]
+    already_in_dst = [d for d in devices_with_codes if d.get("mac") in dst_macs]
+    
+    if already_in_dst:
+        print(f"\n{len(already_in_dst)} devices already in destination org")
+        for d in already_in_dst:
+            report.append(f"inventory: {d.get('mac')} already in destination")
+    
+    if not devices_to_migrate:
+        log("  All devices already in destination org")
+        return report
+    
+    print(f"\n{len(devices_to_migrate)} devices need to be migrated")
+    
+    # Track if we should auto-release
+    do_auto_release = AUTO_RELEASE_FROM_SOURCE
+    
+    # Interactive confirmation
+    if INTERACTIVE_MODE and not DRY_RUN:
+        print("\n*** IMPORTANT ***")
+        print("Devices must be RELEASED from the source org before claiming to destination.")
+        print("This will temporarily disconnect the devices from cloud management.")
+        print("")
+        
+        print("Options:")
+        print("  1. I will manually release devices from source org (via Mist portal)")
+        print("  2. Auto-release devices from source org now (script will do it)")
+        print("  3. Skip device migration")
+        response = input("Choose option (1/2/3): ").strip()
+        
+        if response == "1":
+            print("\n" + "=" * 70)
+            print("MANUAL RELEASE INSTRUCTIONS")
+            print("=" * 70)
+            print("\nRelease these devices from the SOURCE org:")
+            print("")
+            for d in devices_to_migrate:
+                print(f"  MAC: {d.get('mac'):<18}  Name: {d.get('name', 'unnamed')}")
+            print("")
+            print("Steps in Mist Portal:")
+            print("  1. Go to: Organization > Inventory")
+            print("  2. Select the devices listed above")
+            print("  3. Click 'More' > 'Release from Org'")
+            print("  4. Confirm the release")
+            print("")
+            print("=" * 70)
+            input("\nPress ENTER when devices have been released from source org...")
+            do_auto_release = False
+            
+        elif response == "2":
+            print("\nWill auto-release devices from source org...")
+            do_auto_release = True
+            
         else:
-            http.post(f"/api/v1/orgs/{org_id}/networktemplates", nt)
-            rep.append(f"org.nettmpl: {nm} create")
+            log("  Device migration skipped by user")
+            return report
+    
+    # Release from source if auto-release enabled
+    macs_to_release = [d.get("mac") for d in devices_to_migrate]
+    
+    if do_auto_release and not DRY_RUN:
+        print("\nReleasing devices from source org...")
+        success, msg = release_devices_from_org(src_api, src_org_id, macs_to_release)
+        report.append(f"inventory release: {msg}")
+        
+        if not success:
+            log(f"  Release failed: {msg}")
+            return report
+        
+        # Wait for cloud to process
+        print("Waiting for release to propagate (5 seconds)...")
+        time.sleep(5)
+    
+    # Claim to destination
+    claim_codes = [d.get("magic") for d in devices_to_migrate if d.get("magic")]
+    
+    if DRY_RUN:
+        report.append(f"inventory: would claim {len(claim_codes)} devices (dry-run)")
+    else:
+        print("\nClaiming devices to destination org...")
+        success, msg, result = claim_devices_to_org(dst_api, dst_org_id, claim_codes)
+        report.append(f"inventory claim: {msg}")
+        
+        if not success:
+            # Check if devices still belong to source
+            errors = result.get("error", [])
+            reasons = result.get("reason", [])
+            if any("belongs to another org" in r for r in reasons):
+                print("\n" + "!" * 70)
+                print("ERROR: Devices still belong to source org!")
+                print("!" * 70)
+                print("\nThe devices were not released properly. Please release them manually:")
+                print("")
+                for d in devices_to_migrate:
+                    print(f"  MAC: {d.get('mac')}")
+                print("")
+                print("Steps: Mist Portal > Organization > Inventory > Select devices > More > Release")
+                print("")
+                retry = input("Retry claiming after you release them? (yes/no): ").strip().lower()
+                if retry in ("yes", "y"):
+                    print("\nRetrying claim...")
+                    success, msg, result = claim_devices_to_org(dst_api, dst_org_id, claim_codes)
+                    report.append(f"inventory claim retry: {msg}")
+                    if not success:
+                        return report
+                else:
+                    return report
+            else:
+                return report
+    
+    # Assign to sites and place on maps
+    if not DRY_RUN:
+        print("\nAssigning devices to sites...")
+        for device in devices_to_migrate:
+            mac = device.get("mac")
+            src_site_id = device.get("site_id")
+            
+            if not src_site_id:
+                continue
+            
+            # Get destination site ID
+            dst_site_id = mapper.get("sites", src_site_id)
+            if not dst_site_id:
+                report.append(f"inventory: {mac} - destination site not found")
+                continue
+            
+            try:
+                # Assign to site
+                dst_api.put(f"/api/v1/orgs/{dst_org_id}/inventory", {
+                    "op": "assign",
+                    "site_id": dst_site_id,
+                    "macs": [mac]
+                })
+                report.append(f"inventory: {mac} assigned to site")
+                
+                # Place on map if coordinates exist
+                if device.get("map_id") and device.get("x") is not None:
+                    dst_map_id = mapper.get("maps", device.get("map_id"))
+                    if dst_map_id:
+                        # Get device ID
+                        time.sleep(0.5)  # Brief delay for assignment to propagate
+                        dev_list = dst_api.get(f"/api/v1/sites/{dst_site_id}/devices", 
+                                               {"mac": mac})
+                        if dev_list and isinstance(dev_list, list) and len(dev_list) > 0:
+                            dev_id = dev_list[0].get("id")
+                            if dev_id:
+                                dst_api.put(f"/api/v1/sites/{dst_site_id}/devices/{dev_id}", {
+                                    "map_id": dst_map_id,
+                                    "x": device.get("x"),
+                                    "y": device.get("y"),
+                                    "height": device.get("height"),
+                                    "orientation": device.get("orientation"),
+                                    "name": device.get("name"),
+                                })
+                                report.append(f"inventory: {mac} placed on map")
+            except Exception as e:
+                report.append(f"inventory: {mac} assignment error - {e}")
+    
+    return report
+
+
+def import_inventory(api: MistApi, org_id: str, inventory: Dict[str, Any], 
+                     mapper: IdMapper, claim_codes: Dict[str, str] = None) -> List[str]:
+    """
+    Import inventory - simplified version for non-interactive mode.
+    For full interactive migration, use interactive_inventory_migration().
+    """
+    report = []
+    
+    if not inventory:
+        return report
+    
+    # Combine all device types
+    all_devices = (
+        inventory.get("aps", []) + 
+        inventory.get("switches", []) + 
+        inventory.get("gateways", [])
+    )
+    
+    if not all_devices:
+        return report
+    
+    log("  - Processing inventory...")
+    
+    # Get current inventory to see what's already claimed
+    try:
+        current = paged(api, f"/api/v1/orgs/{org_id}/inventory")
+        current_macs = {d.get("mac") for d in current}
+    except Exception:
+        current_macs = set()
+    
+    # Collect claim codes for devices not already in destination
+    codes_to_claim = []
+    for device in all_devices:
+        mac = device.get("mac")
+        if not mac:
+            continue
+        
+        if mac in current_macs:
+            report.append(f"inventory: {mac} already claimed")
+            continue
+        
+        # Get claim code from provided codes or from exported 'magic'
+        code = None
+        if claim_codes:
+            code = claim_codes.get(mac)
+        if not code:
+            code = device.get("magic")
+        
+        if code:
+            codes_to_claim.append(code)
+        else:
+            report.append(f"inventory: {mac} no claim code available")
+    
+    # Claim devices
+    if codes_to_claim:
+        if not DRY_RUN:
+            success, msg, result = claim_devices_to_org(api, org_id, codes_to_claim)
+            report.append(f"inventory: {msg}")
+            
+            if not success and result.get("reason"):
+                reasons = result.get("reason", [])
+                if any("belongs to another org" in r for r in reasons):
+                    report.append("inventory: NOTE - devices must be released from source org first")
+                    report.append("inventory: Run with INTERACTIVE_MODE=True for guided migration")
+        else:
+            report.append(f"inventory: would claim {len(codes_to_claim)} devices (dry-run)")
+    
+    return report
+
+
+# ============================================================================
+# Map (Floorplan) Image Functions
+# ============================================================================
+
+def export_map_image(api: MistApi, site_id: str, map_id: str) -> Optional[Dict[str, Any]]:
+    """Export a map's image data."""
+    try:
+        # Map images are at /api/v1/sites/{site_id}/maps/{map_id}/image
+        image_data = api.get_binary(f"/api/v1/sites/{site_id}/maps/{map_id}/image")
+        if image_data:
+            import base64
+            return {
+                "image_data": base64.b64encode(image_data).decode("ascii"),
+                "content_type": "image/png"  # Could be png, jpg, etc.
+            }
+    except Exception as e:
+        log(f"      Map image not available: {e}")
+    return None
+
+
+def import_map_image(api: MistApi, site_id: str, map_id: str, 
+                     image_info: Dict[str, Any]) -> List[str]:
+    """Import a map's image data."""
+    report = []
+    
+    if not image_info or "image_data" not in image_info:
+        return report
+    
+    if not DRY_RUN:
+        try:
+            import base64
+            image_data = base64.b64decode(image_info["image_data"])
+            content_type = image_info.get("content_type", "image/png")
+            ext = "png" if "png" in content_type else "jpg"
+            api.upload_file(
+                f"/api/v1/sites/{site_id}/maps/{map_id}/image",
+                image_data, f"floorplan.{ext}", content_type
+            )
+            report.append(f"map_image: uploaded")
+        except Exception as e:
+            report.append(f"map_image: upload failed - {e}")
+    else:
+        report.append(f"map_image: would upload (dry-run)")
+    
+    return report
+
+
+# ============================================================================
+# Captive Portal Image and Template Functions
+# ============================================================================
+
+def export_wlan_portal_assets(api: MistApi, scope: str, scope_id: str, wlan: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Export portal image for a WLAN by downloading from thumbnail URL.
+    The portal configuration itself is in the WLAN object (portal, portal_template_url fields).
+    Images must be downloaded from the thumbnail/background URLs if present.
+    """
+    assets = {}
+    wlan_id = wlan.get("id")
+    base = f"/api/v1/{scope}/{scope_id}/wlans/{wlan_id}"
+    
+    # Portal config is already in the WLAN object - these fields contain the portal setup:
+    # - portal: dict with all portal settings (enabled, auth, etc.)
+    # - portal_template_url: URL to portal template
+    # - thumbnail: URL to uploaded logo/background image
+    # - portal_allowed_hostnames, portal_allowed_subnets, portal_denied_hostnames
+    
+    # Try to download portal image if thumbnail URL exists
+    if should_copy("portal_images"):
+        thumbnail_url = wlan.get("thumbnail")
+        if thumbnail_url and thumbnail_url.startswith("http"):
+            try:
+                # Download image from the thumbnail URL
+                import urllib.request
+                req = urllib.request.Request(thumbnail_url)
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    image_data = r.read()
+                    if image_data:
+                        import base64
+                        assets["portal_image"] = base64.b64encode(image_data).decode("ascii")
+                        content_type = r.headers.get("Content-Type", "image/png")
+                        assets["portal_image_type"] = content_type
+            except Exception as e:
+                log(f"        Could not download portal image: {e}")
+    
+    return assets
+
+
+def import_wlan_portal_assets(api: MistApi, scope: str, scope_id: str, wlan_id: str, 
+                               assets: Dict[str, Any]) -> List[str]:
+    """
+    Import portal image for a WLAN.
+    Portal configuration is part of the WLAN object and copied with it.
+    This function handles the binary image upload separately.
+    """
+    report = []
+    base = f"/api/v1/{scope}/{scope_id}/wlans/{wlan_id}"
+    
+    # Upload portal image if present
+    if "portal_image" in assets and assets["portal_image"]:
+        if not DRY_RUN:
+            try:
+                import base64
+                image_data = base64.b64decode(assets["portal_image"])
+                content_type = assets.get("portal_image_type", "image/png")
+                ext = "png" if "png" in content_type else "jpg"
+                api.upload_file(f"{base}/portal_image", image_data, f"portal.{ext}", content_type)
+                report.append(f"portal_image: uploaded")
+            except Exception as e:
+                report.append(f"portal_image: upload failed - {e}")
+        else:
+            report.append(f"portal_image: would upload (dry-run)")
+    
+    return report
+
+
+def export_all_wlan_portal_assets(api: MistApi, scope: str, scope_id: str, 
+                                   wlans: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Export portal assets for all WLANs that have portal enabled."""
+    all_assets = {}
+    
+    for wlan in wlans:
+        ssid = wlan_key(wlan)
+        
+        # Check if this WLAN has portal enabled (check various portal indicators)
+        has_portal = (
+            wlan.get("portal") or 
+            wlan.get("portal_template_url") or 
+            wlan.get("thumbnail") or
+            wlan.get("auth", {}).get("type") in ["open", "psk"] and wlan.get("portal_enabled")
+        )
+        
+        if not has_portal:
+            continue
+        
+        log(f"      Checking portal assets for WLAN: {ssid}")
+        assets = export_wlan_portal_assets(api, scope, scope_id, wlan)
+        if assets:
+            all_assets[ssid] = assets
+    
+    return all_assets
+
+
+# ============================================================================
+# Organization Level Export/Import Functions
+# ============================================================================
+
+def export_org(api: MistApi, org_id: str) -> Dict[str, Any]:
+    """Export all organization-level configuration."""
+    log("Exporting organization configuration...")
+    blob = {"org_id": org_id, "exported_at": datetime.now().isoformat()}
+    
+    # Org settings (just metadata, be careful with sensitive data)
+    if should_copy("org_settings"):
+        log("  - Org settings")
+        blob["org_settings"] = safe_get(api, f"/api/v1/orgs/{org_id}/setting", {})
+    
+    # Site groups (needed before sites for ID mapping)
+    if should_copy("sitegroups"):
+        log("  - Site groups")
+        blob["sitegroups"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/sitegroups")]
+    
+    # Sites
+    if should_copy("sites"):
+        log("  - Sites")
+        blob["sites"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/sites")]
+    
+    # RF Templates
+    if should_copy("rftemplates"):
+        log("  - RF templates")
+        blob["rftemplates"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/rftemplates")]
+    
+    # AP Templates
+    if should_copy("aptemplates"):
+        log("  - AP templates")
+        blob["aptemplates"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/aptemplates")]
+    
+    # Network Templates
+    if should_copy("networktemplates"):
+        log("  - Network templates")
+        blob["networktemplates"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/networktemplates")]
+    
+    # Gateway Templates
+    if should_copy("gatewaytemplates"):
+        log("  - Gateway templates")
+        blob["gatewaytemplates"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/gatewaytemplates")]
+    
+    # WLAN Templates
+    if should_copy("templates"):
+        log("  - WLAN templates")
+        blob["templates"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/templates")]
+    
     # Org WLANs
-    dst_wl = paged(http, f"/api/v1/orgs/{org_id}/wlans")
-    dst_by = {wlan_key(w): w for w in dst_wl}
-    for w in blob["wlans"]:
-        key = wlan_key(w)
-        if key in dst_by and digest(slim(dst_by[key]))==digest(w):
-            rep.append(f"org.wlan: {key} no change")
-        elif key in dst_by:
-            http.put(f"/api/v1/orgs/{org_id}/wlans/{dst_by[key]['id']}", w)
-            rep.append(f"org.wlan: {key} update")
-        else:
-            http.post(f"/api/v1/orgs/{org_id}/wlans", w)
-            rep.append(f"org.wlan: {key} create")
-    # Wx rules
-    if endpoint_ok(http, f"/api/v1/orgs/{org_id}/wxrules"):
-        dst_rules = by_name(paged(http, f"/api/v1/orgs/{org_id}/wxrules"))
-        for r in blob["wxrules"]:
-            nm = r.get("name","")
-            if nm in dst_rules and digest(slim(dst_rules[nm]))==digest(r):
-                rep.append(f"org.wxrule: {nm} no change")
-            elif nm in dst_rules:
-                http.put(f"/api/v1/orgs/{org_id}/wxrules/{dst_rules[nm]['id']}", r)
-                rep.append(f"org.wxrule: {nm} update")
-            else:
-                http.post(f"/api/v1/orgs/{org_id}/wxrules", r)
-                rep.append(f"org.wxrule: {nm or '<unnamed>'} create")
-    else:
-        rep.append("org.wxrule: endpoint not available")
-    # Wx tunnels
-    if endpoint_ok(http, f"/api/v1/orgs/{org_id}/wxtunnels"):
-        dst_tuns = by_name(paged(http, f"/api/v1/orgs/{org_id}/wxtunnels"))
-        for t in blob["wxtunnels"]:
-            nm = t.get("name","")
-            if nm in dst_tuns and digest(slim(dst_tuns[nm]))==digest(t):
-                rep.append(f"org.wxtun: {nm} no change")
-            elif nm in dst_tuns:
-                http.put(f"/api/v1/orgs/{org_id}/wxtunnels/{dst_tuns[nm]['id']}", t)
-                rep.append(f"org.wxtun: {nm} update")
-            else:
-                http.post(f"/api/v1/orgs/{org_id}/wxtunnels", t)
-                rep.append(f"org.wxtun: {nm or '<unnamed>'} create")
-    else:
-        rep.append("org.wxtun: endpoint not available")
-    return rep
-
-# ---------- SITE level ----------
-def export_site(http:Http, site_id:str) -> Dict[str,Any]:
-    blob={}
-    blob["settings"] = slim(http.get(f"/api/v1/sites/{site_id}/setting"))
-    blob["wlans"]    = [slim(x) for x in paged(http, f"/api/v1/sites/{site_id}/wlans")]
-    blob["wxrules"]  = [slim(x) for x in paged(http, f"/api/v1/sites/{site_id}/wxrules")]   if endpoint_ok(http, f"/api/v1/sites/{site_id}/wxrules")   else []
-    blob["wxtunnels"]= [slim(x) for x in paged(http, f"/api/v1/sites/{site_id}/wxtunnels")] if endpoint_ok(http, f"/api/v1/sites/{site_id}/wxtunnels") else []
+    if should_copy("org_wlans"):
+        log("  - Org WLANs")
+        blob["org_wlans"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/wlans")]
+    
+    # Org PSKs
+    if should_copy("org_psks"):
+        log("  - Org PSKs")
+        blob["org_psks"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/psks")]
+    
+    # PSK Portals
+    if should_copy("pskportals"):
+        log("  - PSK portals")
+        blob["pskportals"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/pskportals")]
+    
+    # WxLAN Rules
+    if should_copy("wxrules"):
+        log("  - WxLAN rules")
+        blob["wxrules"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/wxrules")]
+    
+    # WxLAN Tags
+    if should_copy("wxtags"):
+        log("  - WxLAN tags")
+        blob["wxtags"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/wxtags")]
+    
+    # WxLAN Tunnels
+    if should_copy("wxtunnels"):
+        log("  - WxLAN tunnels")
+        blob["wxtunnels"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/wxtunnels")]
+    
+    # Networks
+    if should_copy("networks"):
+        log("  - Networks")
+        blob["networks"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/networks")]
+    
+    # Services
+    if should_copy("services"):
+        log("  - Services")
+        blob["services"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/services")]
+    
+    # Service Policies
+    if should_copy("servicepolicies"):
+        log("  - Service policies")
+        blob["servicepolicies"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/servicepolicies")]
+    
+    # Security Policies
+    if should_copy("secpolicies"):
+        log("  - Security policies")
+        blob["secpolicies"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/secpolicies")]
+    
+    # VPNs
+    if should_copy("vpns"):
+        log("  - VPNs")
+        blob["vpns"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/vpns")]
+    
+    # EVPN Topologies
+    if should_copy("evpn_topologies"):
+        log("  - EVPN topologies")
+        blob["evpn_topologies"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/evpn_topologies")]
+    
+    # Device Profiles (AP)
+    if should_copy("deviceprofiles"):
+        log("  - Device profiles (AP)")
+        blob["deviceprofiles"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/deviceprofiles")]
+    
+    # Device Profiles (Gateway) - if endpoint exists
+    if should_copy("deviceprofiles_gateway"):
+        log("  - Device profiles (Gateway)")
+        blob["deviceprofiles_gateway"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/deviceprofiles/gateway")]
+    
+    # Alarm Templates
+    if should_copy("alarmtemplates"):
+        log("  - Alarm templates")
+        blob["alarmtemplates"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/alarmtemplates")]
+    
+    # Asset Filters
+    if should_copy("assetfilters"):
+        log("  - Asset filters")
+        blob["assetfilters"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/assetfilters")]
+    
+    # Org Assets
+    if should_copy("org_assets"):
+        log("  - Org assets")
+        blob["org_assets"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/assets")]
+    
+    # Mist Edge
+    if should_copy("mxedges"):
+        log("  - Mist Edge")
+        blob["mxedges"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/mxedges")]
+    
+    # Mist Edge Clusters
+    if should_copy("mxclusters"):
+        log("  - Mist Edge clusters")
+        blob["mxclusters"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/mxclusters")]
+    
+    # NAC Rules
+    if should_copy("nacrules"):
+        log("  - NAC rules")
+        blob["nacrules"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/nacrules")]
+    
+    # NAC Tags
+    if should_copy("nactags"):
+        log("  - NAC tags")
+        blob["nactags"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/nactags")]
+    
+    # IDP Profiles
+    if should_copy("idpprofiles"):
+        log("  - IDP profiles")
+        blob["idpprofiles"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/idpprofiles")]
+    
+    # Webhooks
+    if should_copy("webhooks"):
+        log("  - Webhooks")
+        blob["webhooks"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/webhooks")]
+    
+    # SDK Templates
+    if should_copy("sdktemplates"):
+        log("  - SDK templates")
+        blob["sdktemplates"] = [slim(x) for x in safe_paged(api, f"/api/v1/orgs/{org_id}/sdktemplates")]
+    
+    # Portal assets for org WLANs (images and templates)
+    if should_copy("portal_images") or should_copy("portal_templates"):
+        if "org_wlans" in blob or should_copy("org_wlans"):
+            log("  - Portal assets for org WLANs")
+            # Need full WLAN list with IDs for portal asset export
+            wlans_full = safe_paged(api, f"/api/v1/orgs/{org_id}/wlans")
+            blob["org_wlan_portal_assets"] = export_all_wlan_portal_assets(api, "orgs", org_id, wlans_full)
+    
+    # Inventory (devices with claim codes and placement)
+    if should_copy("inventory"):
+        log("  - Inventory")
+        blob["inventory"] = export_inventory(api, org_id)
+    
     return blob
 
-def import_site(http:Http, dst_site_id:str, blob:Dict[str,Any]) -> List[str]:
-    rep=[]
-    # settings
-    cur = slim(http.get(f"/api/v1/sites/{dst_site_id}/setting"))
-    if digest(cur)!=digest(blob["settings"]):
-        http.put(f"/api/v1/sites/{dst_site_id}/setting", blob["settings"])
-        rep.append("site.settings: update")
-    else:
-        rep.append("site.settings: no change")
-    # wlans
-    dst_wl = paged(http, f"/api/v1/sites/{dst_site_id}/wlans")
-    dst_by = {wlan_key(w): w for w in dst_wl}
-    for w in blob["wlans"]:
-        key = wlan_key(w)
-        if key in dst_by and digest(slim(dst_by[key]))==digest(w):
-            rep.append(f"site.wlan: {key} no change")
-        elif key in dst_by:
-            http.put(f"/api/v1/sites/{dst_site_id}/wlans/{dst_by[key]['id']}", w)
-            rep.append(f"site.wlan: {key} update")
+
+def import_org(api: MistApi, org_id: str, blob: Dict[str, Any], mapper: IdMapper) -> List[str]:
+    """Import organization-level configuration."""
+    log("Importing organization configuration...")
+    report = []
+    
+    # Process in dependency order
+    
+    # 1. Site Groups (needed for site assignment)
+    if "sitegroups" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/sitegroups",
+            blob["sitegroups"], "sitegroup", "name", mapper
+        ))
+    
+    # 2. Networks (needed by templates and policies)
+    if "networks" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/networks",
+            blob["networks"], "network", "name", mapper
+        ))
+    
+    # 3. Services
+    if "services" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/services",
+            blob["services"], "service", "name", mapper
+        ))
+    
+    # 4. WxLAN Tags (needed by WxLAN rules)
+    if "wxtags" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/wxtags",
+            blob["wxtags"], "wxtag", "name", mapper
+        ))
+    
+    # 5. WxLAN Tunnels
+    if "wxtunnels" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/wxtunnels",
+            blob["wxtunnels"], "wxtunnel", "name", mapper
+        ))
+    
+    # 6. RF Templates
+    if "rftemplates" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/rftemplates",
+            blob["rftemplates"], "rftemplate", "name", mapper
+        ))
+    
+    # 7. AP Templates
+    if "aptemplates" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/aptemplates",
+            blob["aptemplates"], "aptemplate", "name", mapper
+        ))
+    
+    # 8. Network Templates
+    if "networktemplates" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/networktemplates",
+            blob["networktemplates"], "networktemplate", "name", mapper
+        ))
+    
+    # 9. Gateway Templates
+    if "gatewaytemplates" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/gatewaytemplates",
+            blob["gatewaytemplates"], "gatewaytemplate", "name", mapper
+        ))
+    
+    # 10. WLAN Templates
+    if "templates" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/templates",
+            blob["templates"], "template", "name", mapper
+        ))
+    
+    # 11. Device Profiles
+    if "deviceprofiles" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/deviceprofiles",
+            blob["deviceprofiles"], "deviceprofile", "name", mapper
+        ))
+    
+    # 12. Device Profiles (Gateway)
+    if "deviceprofiles_gateway" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/deviceprofiles/gateway",
+            blob["deviceprofiles_gateway"], "deviceprofile_gw", "name", mapper
+        ))
+    
+    # 13. Alarm Templates
+    if "alarmtemplates" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/alarmtemplates",
+            blob["alarmtemplates"], "alarmtemplate", "name", mapper
+        ))
+    
+    # 14. Mist Edge Clusters
+    if "mxclusters" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/mxclusters",
+            blob["mxclusters"], "mxcluster", "name", mapper
+        ))
+    
+    # 15. Mist Edge
+    if "mxedges" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/mxedges",
+            blob["mxedges"], "mxedge", "name", mapper
+        ))
+    
+    # 16. Asset Filters
+    if "assetfilters" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/assetfilters",
+            blob["assetfilters"], "assetfilter", "name", mapper
+        ))
+    
+    # 17. Org Assets
+    if "org_assets" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/assets",
+            blob["org_assets"], "org_asset", "name", mapper
+        ))
+    
+    # 18. Security Policies
+    if "secpolicies" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/secpolicies",
+            blob["secpolicies"], "secpolicy", "name", mapper
+        ))
+    
+    # 19. Service Policies
+    if "servicepolicies" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/servicepolicies",
+            blob["servicepolicies"], "servicepolicy", "name", mapper
+        ))
+    
+    # 20. VPNs
+    if "vpns" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/vpns",
+            blob["vpns"], "vpn", "name", mapper
+        ))
+    
+    # 21. EVPN Topologies
+    if "evpn_topologies" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/evpn_topologies",
+            blob["evpn_topologies"], "evpn_topology", "name", mapper
+        ))
+    
+    # 22. WxLAN Rules
+    if "wxrules" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/wxrules",
+            blob["wxrules"], "wxrule", "name", mapper
+        ))
+    
+    # 23. Org WLANs
+    if "org_wlans" in blob:
+        report.extend(_import_wlans(
+            api, f"/api/v1/orgs/{org_id}/wlans",
+            blob["org_wlans"], "org_wlan", mapper
+        ))
+    
+    # 24. Org PSKs
+    if "org_psks" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/psks",
+            blob["org_psks"], "org_psk", "name", mapper
+        ))
+    
+    # 25. PSK Portals
+    if "pskportals" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/pskportals",
+            blob["pskportals"], "pskportal", "name", mapper
+        ))
+    
+    # 26. NAC Tags
+    if "nactags" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/nactags",
+            blob["nactags"], "nactag", "name", mapper
+        ))
+    
+    # 27. NAC Rules
+    if "nacrules" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/nacrules",
+            blob["nacrules"], "nacrule", "name", mapper
+        ))
+    
+    # 28. IDP Profiles
+    if "idpprofiles" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/idpprofiles",
+            blob["idpprofiles"], "idpprofile", "name", mapper
+        ))
+    
+    # 29. Webhooks
+    if "webhooks" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/webhooks",
+            blob["webhooks"], "webhook", "name", mapper
+        ))
+    
+    # 30. SDK Templates
+    if "sdktemplates" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/orgs/{org_id}/sdktemplates",
+            blob["sdktemplates"], "sdktemplate", "name", mapper
+        ))
+    
+    # 31. Portal assets for org WLANs
+    if "org_wlan_portal_assets" in blob and blob["org_wlan_portal_assets"]:
+        log("  - Importing portal assets for org WLANs")
+        # Get current WLANs to find IDs by SSID
+        current_wlans = paged(api, f"/api/v1/orgs/{org_id}/wlans")
+        wlan_id_by_ssid = {wlan_key(w): w.get("id") for w in current_wlans}
+        
+        for ssid, assets in blob["org_wlan_portal_assets"].items():
+            wlan_id = wlan_id_by_ssid.get(ssid)
+            if wlan_id:
+                log(f"    - Portal assets for WLAN: {ssid}")
+                portal_reports = import_wlan_portal_assets(api, "orgs", org_id, wlan_id, assets)
+                for pr in portal_reports:
+                    report.append(f"org_wlan.{ssid}.{pr}")
+            else:
+                report.append(f"org_wlan.{ssid}.portal: WLAN not found, skipping portal assets")
+    
+    # 32. Inventory (claim devices) - should be done after sites exist for assignment
+    # Note: This is typically done at the end, after all sites are created
+    if "inventory" in blob and blob["inventory"]:
+        report.extend(import_inventory(api, org_id, blob["inventory"], mapper, DEVICE_CLAIM_CODES))
+    
+    return report
+
+
+def _import_resource(api: MistApi, base_path: str, items: List[Dict[str, Any]], 
+                     resource_type: str, key_field: str, mapper: IdMapper) -> List[str]:
+    """Generic resource import with upsert logic."""
+    report = []
+    
+    if not items:
+        return report
+    
+    log(f"  - Importing {resource_type}s...")
+    
+    # Get existing items
+    try:
+        existing = paged(api, base_path)
+    except Exception as e:
+        report.append(f"{resource_type}: endpoint not available - {e}")
+        return report
+    
+    existing_by_key = by_key(existing, key_field)
+    
+    for item in items:
+        name = item.get(key_field, "<unnamed>")
+        # Remap any ID references
+        item = mapper.remap_object(item)
+        
+        if name in existing_by_key:
+            dst_item = existing_by_key[name]
+            src_digest = digest(slim(item))
+            dst_digest = digest(slim(dst_item))
+            
+            if src_digest == dst_digest:
+                report.append(f"{resource_type}: {name} no change")
+                # Still record the mapping
+                if "id" in item:
+                    mapper.add(f"{resource_type}s", item.get("_src_id", ""), dst_item["id"])
+            else:
+                if not DRY_RUN:
+                    try:
+                        api.put(f"{base_path}/{dst_item['id']}", item)
+                        report.append(f"{resource_type}: {name} updated")
+                    except Exception as e:
+                        report.append(f"{resource_type}: {name} update failed - {e}")
+                else:
+                    report.append(f"{resource_type}: {name} would update (dry-run)")
+                mapper.add(f"{resource_type}s", item.get("_src_id", ""), dst_item["id"])
         else:
-            http.post(f"/api/v1/sites/{dst_site_id}/wlans", w)
-            rep.append(f"site.wlan: {key} create")
-    # wxrules
-    if endpoint_ok(http, f"/api/v1/sites/{dst_site_id}/wxrules"):
-        dst_rules = by_name(paged(http, f"/api/v1/sites/{dst_site_id}/wxrules"))
-        for r in blob["wxrules"]:
-            nm = r.get("name","")
-            if nm in dst_rules and digest(slim(dst_rules[nm]))==digest(r):
-                rep.append(f"site.wxrule: {nm} no change")
-            elif nm in dst_rules:
-                http.put(f"/api/v1/sites/{dst_site_id}/wxrules/{dst_rules[nm]['id']}", r)
-                rep.append(f"site.wxrule: {nm} update")
+            if not DRY_RUN:
+                try:
+                    result = api.post(base_path, item)
+                    new_id = result.get("id") if result else None
+                    report.append(f"{resource_type}: {name} created")
+                    if new_id:
+                        mapper.add(f"{resource_type}s", item.get("_src_id", ""), new_id)
+                except Exception as e:
+                    report.append(f"{resource_type}: {name} create failed - {e}")
             else:
-                http.post(f"/api/v1/sites/{dst_site_id}/wxrules", r)
-                rep.append(f"site.wxrule: {nm or '<unnamed>'} create")
-    else:
-        rep.append("site.wxrule: endpoint not available")
-    # wxtunnels
-    if endpoint_ok(http, f"/api/v1/sites/{dst_site_id}/wxtunnels"):
-        dst_tuns = by_name(paged(http, f"/api/v1/sites/{dst_site_id}/wxtunnels"))
-        for t in blob["wxtunnels"]:
-            nm = t.get("name","")
-            if nm in dst_tuns and digest(slim(dst_tuns[nm]))==digest(t):
-                rep.append(f"site.wxtunnel: {nm} no change")
-            elif nm in dst_tuns:
-                http.put(f"/api/v1/sites/{dst_site_id}/wxtunnels/{dst_tuns[nm]['id']}", t)
-                rep.append(f"site.wxtunnel: {nm} update")
+                report.append(f"{resource_type}: {name} would create (dry-run)")
+    
+    return report
+
+
+def _import_wlans(api: MistApi, base_path: str, items: List[Dict[str, Any]], 
+                  resource_type: str, mapper: IdMapper) -> List[str]:
+    """Import WLANs using SSID as key."""
+    report = []
+    
+    if not items:
+        return report
+    
+    log(f"  - Importing {resource_type}s...")
+    
+    try:
+        existing = paged(api, base_path)
+    except Exception as e:
+        report.append(f"{resource_type}: endpoint not available - {e}")
+        return report
+    
+    existing_by_ssid = {wlan_key(w): w for w in existing}
+    
+    for item in items:
+        ssid = wlan_key(item)
+        if not ssid:
+            continue
+        
+        item = mapper.remap_object(item)
+        
+        if ssid in existing_by_ssid:
+            dst_item = existing_by_ssid[ssid]
+            if digest(slim(item)) == digest(slim(dst_item)):
+                report.append(f"{resource_type}: {ssid} no change")
             else:
-                http.post(f"/api/v1/sites/{dst_site_id}/wxtunnels", t)
-                rep.append(f"site.wxtunnel: {nm or '<unnamed>'} create")
-    else:
-        rep.append("site.wxtunnel: endpoint not available")
-    return rep
+                if not DRY_RUN:
+                    try:
+                        api.put(f"{base_path}/{dst_item['id']}", item)
+                        report.append(f"{resource_type}: {ssid} updated")
+                    except Exception as e:
+                        report.append(f"{resource_type}: {ssid} update failed - {e}")
+                else:
+                    report.append(f"{resource_type}: {ssid} would update (dry-run)")
+        else:
+            if not DRY_RUN:
+                try:
+                    api.post(base_path, item)
+                    report.append(f"{resource_type}: {ssid} created")
+                except Exception as e:
+                    report.append(f"{resource_type}: {ssid} create failed - {e}")
+            else:
+                report.append(f"{resource_type}: {ssid} would create (dry-run)")
+    
+    return report
 
-# ---------- site helpers ----------
-def list_sites(http:Http, org_id:str) -> List[Dict[str,Any]]:
-    return paged(http, f"/api/v1/orgs/{org_id}/sites")
 
-def get_or_create_site_by_name(http:Http, org_id:str, name:str) -> str:
-    for s in list_sites(http, org_id):
-        if s.get("name")==name:
+# ============================================================================
+# Site Level Export/Import Functions
+# ============================================================================
+
+def export_site(api: MistApi, site_id: str) -> Dict[str, Any]:
+    """Export all site-level configuration."""
+    blob = {"site_id": site_id}
+    
+    # Site settings
+    if should_copy("site_settings"):
+        blob["settings"] = slim(safe_get(api, f"/api/v1/sites/{site_id}/setting", {}))
+    
+    # Site WLANs
+    if should_copy("site_wlans"):
+        blob["wlans"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/wlans")]
+    
+    # Site PSKs
+    if should_copy("site_psks"):
+        blob["psks"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/psks")]
+    
+    # Maps (floorplans) - metadata with source IDs for zone remapping
+    if should_copy("maps"):
+        maps_raw = safe_paged(api, f"/api/v1/sites/{site_id}/maps")
+        blob["maps"] = []
+        for m in maps_raw:
+            map_entry = slim(m)
+            map_entry["_src_id"] = m.get("id")  # Preserve source ID for zone remapping
+            blob["maps"].append(map_entry)
+        
+        # Export map images if enabled
+        if should_copy("map_images") and blob["maps"]:
+            log("    - Map images")
+            blob["map_images"] = {}
+            for m in maps_raw:
+                map_id = m.get("id")
+                map_name = m.get("name", map_id)
+                if map_id:
+                    image_info = export_map_image(api, site_id, map_id)
+                    if image_info:
+                        blob["map_images"][map_name] = image_info
+    
+    # Zones
+    if should_copy("zones"):
+        blob["zones"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/zones")]
+    
+    # RSSI Zones
+    if should_copy("rssizones"):
+        blob["rssizones"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/rssizones")]
+    
+    # Virtual Beacons
+    if should_copy("vbeacons"):
+        blob["vbeacons"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/vbeacons")]
+    
+    # Beacons
+    if should_copy("beacons"):
+        blob["beacons"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/beacons")]
+    
+    # Assets
+    if should_copy("site_assets"):
+        blob["assets"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/assets")]
+    
+    # Asset Filters
+    if should_copy("site_assetfilters"):
+        blob["assetfilters"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/assetfilters")]
+    
+    # WxLAN Rules
+    if should_copy("site_wxrules"):
+        blob["wxrules"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/wxrules")]
+    
+    # WxLAN Tunnels
+    if should_copy("site_wxtunnels"):
+        blob["wxtunnels"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/wxtunnels")]
+    
+    # WxLAN Tags
+    if should_copy("site_wxtags"):
+        blob["wxtags"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/wxtags")]
+    
+    # Networks (may not exist at site level - depends on subscription)
+    if should_copy("site_networks"):
+        if endpoint_ok(api, f"/api/v1/sites/{site_id}/networks"):
+            blob["networks"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/networks")]
+    
+    # Services (may not exist at site level)
+    if should_copy("site_services"):
+        if endpoint_ok(api, f"/api/v1/sites/{site_id}/services"):
+            blob["services"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/services")]
+    
+    # Service Policies (may not exist at site level)
+    if should_copy("site_servicepolicies"):
+        if endpoint_ok(api, f"/api/v1/sites/{site_id}/servicepolicies"):
+            blob["servicepolicies"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/servicepolicies")]
+    
+    # Webhooks
+    if should_copy("site_webhooks"):
+        blob["webhooks"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/webhooks")]
+    
+    # Site Mist Edge
+    if should_copy("site_mxedges"):
+        blob["mxedges"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/mxedges")]
+    
+    # Mx Tunnels (may not exist without Mist Edge subscription)
+    if should_copy("mxtunnels"):
+        if endpoint_ok(api, f"/api/v1/sites/{site_id}/mxtunnels"):
+            blob["mxtunnels"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/mxtunnels")]
+    
+    # EVPN Topologies
+    if should_copy("site_evpn_topologies"):
+        if endpoint_ok(api, f"/api/v1/sites/{site_id}/evpn_topologies"):
+            blob["evpn_topologies"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/evpn_topologies")]
+    
+    # HA Clusters
+    if should_copy("haclusters"):
+        if endpoint_ok(api, f"/api/v1/sites/{site_id}/haclusters"):
+            blob["haclusters"] = [slim(x) for x in safe_paged(api, f"/api/v1/sites/{site_id}/haclusters")]
+    
+    # Virtual Chassis (may not exist)
+    if should_copy("vcs"):
+        if endpoint_ok(api, f"/api/v1/sites/{site_id}/devices/virtual_chassis"):
+            blob["vcs"] = safe_get(api, f"/api/v1/sites/{site_id}/devices/virtual_chassis", [])
+    
+    # Portal assets for site WLANs (images and templates)
+    if should_copy("portal_images") or should_copy("portal_templates"):
+        if "wlans" in blob or should_copy("site_wlans"):
+            log("    - Portal assets for site WLANs")
+            wlans_full = safe_paged(api, f"/api/v1/sites/{site_id}/wlans")
+            blob["site_wlan_portal_assets"] = export_all_wlan_portal_assets(api, "sites", site_id, wlans_full)
+    
+    return blob
+
+
+def import_site(api: MistApi, site_id: str, blob: Dict[str, Any], mapper: IdMapper) -> List[str]:
+    """Import site-level configuration."""
+    report = []
+    
+    # Site settings
+    if "settings" in blob:
+        log("    - Site settings")
+        try:
+            cur = slim(api.get(f"/api/v1/sites/{site_id}/setting"))
+            if digest(cur) != digest(blob["settings"]):
+                if not DRY_RUN:
+                    api.put(f"/api/v1/sites/{site_id}/setting", mapper.remap_object(blob["settings"]))
+                    report.append("site.settings: updated")
+                else:
+                    report.append("site.settings: would update (dry-run)")
+            else:
+                report.append("site.settings: no change")
+        except Exception as e:
+            report.append(f"site.settings: failed - {e}")
+    
+    # Maps - need to track ID mappings for zones
+    if "maps" in blob:
+        log("    - Maps")
+        try:
+            existing_maps = paged(api, f"/api/v1/sites/{site_id}/maps")
+            existing_by_name = by_key(existing_maps, "name")
+            
+            for item in blob["maps"]:
+                name = item.get("name", "<unnamed>")
+                src_id = item.get("_src_id")  # Track source ID for zone remapping
+                item_clean = {k: v for k, v in item.items() if k != "_src_id"}
+                
+                if name in existing_by_name:
+                    dst_item = existing_by_name[name]
+                    # Record mapping for zones
+                    if src_id:
+                        mapper.add("maps", src_id, dst_item["id"])
+                    
+                    if digest(slim(item_clean)) == digest(slim(dst_item)):
+                        report.append(f"map: {name} no change")
+                    else:
+                        if not DRY_RUN:
+                            try:
+                                api.put(f"/api/v1/sites/{site_id}/maps/{dst_item['id']}", item_clean)
+                                report.append(f"map: {name} updated")
+                            except Exception as e:
+                                report.append(f"map: {name} update failed - {e}")
+                        else:
+                            report.append(f"map: {name} would update (dry-run)")
+                else:
+                    if not DRY_RUN:
+                        try:
+                            result = api.post(f"/api/v1/sites/{site_id}/maps", item_clean)
+                            new_id = result.get("id") if result else None
+                            report.append(f"map: {name} created")
+                            if new_id and src_id:
+                                mapper.add("maps", src_id, new_id)
+                        except Exception as e:
+                            report.append(f"map: {name} create failed - {e}")
+                    else:
+                        report.append(f"map: {name} would create (dry-run)")
+        except Exception as e:
+            report.append(f"maps: endpoint not available - {e}")
+        
+        # Import map images if present
+        if "map_images" in blob and blob["map_images"]:
+            log("    - Map images")
+            # Get current maps to find IDs by name
+            current_maps = paged(api, f"/api/v1/sites/{site_id}/maps")
+            map_id_by_name = {m.get("name"): m.get("id") for m in current_maps}
+            
+            for map_name, image_info in blob["map_images"].items():
+                map_id = map_id_by_name.get(map_name)
+                if map_id:
+                    image_reports = import_map_image(api, site_id, map_id, image_info)
+                    for ir in image_reports:
+                        report.append(f"map.{map_name}.{ir}")
+                else:
+                    report.append(f"map.{map_name}.image: map not found, skipping image")
+    
+    # Zones (need maps first for map_id remapping)
+    if "zones" in blob:
+        log("    - Zones")
+        # Zones require a valid map_id - need to remap from source to destination
+        # First get the current maps to build the ID mapping
+        if "maps" in blob:
+            current_maps = paged(api, f"/api/v1/sites/{site_id}/maps")
+            map_name_to_id = {m.get("name"): m.get("id") for m in current_maps}
+            
+            # Also build reverse lookup from source maps
+            src_map_id_to_name = {}
+            for m in blob.get("maps", []):
+                if "_src_id" in m:
+                    src_map_id_to_name[m["_src_id"]] = m.get("name")
+        
+        zones_to_import = []
+        for zone in blob["zones"]:
+            zone = mapper.remap_object(zone)
+            
+            # Remap map_id specifically
+            src_map_id = zone.get("map_id")
+            if src_map_id:
+                # Try to find destination map_id
+                dst_map_id = mapper.get("maps", src_map_id)
+                if dst_map_id:
+                    zone["map_id"] = dst_map_id
+                    zones_to_import.append(zone)
+                else:
+                    # Try to find by name if we have the mapping
+                    map_name = src_map_id_to_name.get(src_map_id) if "maps" in blob else None
+                    if map_name and map_name in map_name_to_id:
+                        zone["map_id"] = map_name_to_id[map_name]
+                        zones_to_import.append(zone)
+                    else:
+                        report.append(f"zone: {zone.get('name', '<unnamed>')} skipped - map_id not found")
+            else:
+                report.append(f"zone: {zone.get('name', '<unnamed>')} skipped - no map_id")
+        
+        if zones_to_import:
+            report.extend(_import_resource(
+                api, f"/api/v1/sites/{site_id}/zones",
+                zones_to_import, "zone", "name", mapper
+            ))
+    
+    # RSSI Zones
+    if "rssizones" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/rssizones",
+            blob["rssizones"], "rssizone", "name", mapper
+        ))
+    
+    # Virtual Beacons
+    if "vbeacons" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/vbeacons",
+            blob["vbeacons"], "vbeacon", "name", mapper
+        ))
+    
+    # Beacons
+    if "beacons" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/beacons",
+            blob["beacons"], "beacon", "name", mapper
+        ))
+    
+    # Networks
+    if "networks" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/networks",
+            blob["networks"], "site_network", "name", mapper
+        ))
+    
+    # Services
+    if "services" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/services",
+            blob["services"], "site_service", "name", mapper
+        ))
+    
+    # WxLAN Tags
+    if "wxtags" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/wxtags",
+            blob["wxtags"], "site_wxtag", "name", mapper
+        ))
+    
+    # WxLAN Tunnels
+    if "wxtunnels" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/wxtunnels",
+            blob["wxtunnels"], "site_wxtunnel", "name", mapper
+        ))
+    
+    # WxLAN Rules
+    if "wxrules" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/wxrules",
+            blob["wxrules"], "site_wxrule", "name", mapper
+        ))
+    
+    # Site WLANs
+    if "wlans" in blob:
+        report.extend(_import_wlans(
+            api, f"/api/v1/sites/{site_id}/wlans",
+            blob["wlans"], "site_wlan", mapper
+        ))
+    
+    # Site PSKs
+    if "psks" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/psks",
+            blob["psks"], "site_psk", "name", mapper
+        ))
+    
+    # Asset Filters
+    if "assetfilters" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/assetfilters",
+            blob["assetfilters"], "site_assetfilter", "name", mapper
+        ))
+    
+    # Assets
+    if "assets" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/assets",
+            blob["assets"], "site_asset", "name", mapper
+        ))
+    
+    # Service Policies
+    if "servicepolicies" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/servicepolicies",
+            blob["servicepolicies"], "site_servicepolicy", "name", mapper
+        ))
+    
+    # Webhooks
+    if "webhooks" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/webhooks",
+            blob["webhooks"], "site_webhook", "name", mapper
+        ))
+    
+    # Site Mist Edge
+    if "mxedges" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/mxedges",
+            blob["mxedges"], "site_mxedge", "name", mapper
+        ))
+    
+    # Mx Tunnels
+    if "mxtunnels" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/mxtunnels",
+            blob["mxtunnels"], "mxtunnel", "name", mapper
+        ))
+    
+    # EVPN Topologies
+    if "evpn_topologies" in blob:
+        report.extend(_import_resource(
+            api, f"/api/v1/sites/{site_id}/evpn_topologies",
+            blob["evpn_topologies"], "site_evpn", "name", mapper
+        ))
+    
+    # Portal assets for site WLANs
+    if "site_wlan_portal_assets" in blob and blob["site_wlan_portal_assets"]:
+        log("    - Importing portal assets for site WLANs")
+        # Get current WLANs to find IDs by SSID
+        current_wlans = paged(api, f"/api/v1/sites/{site_id}/wlans")
+        wlan_id_by_ssid = {wlan_key(w): w.get("id") for w in current_wlans}
+        
+        for ssid, assets in blob["site_wlan_portal_assets"].items():
+            wlan_id = wlan_id_by_ssid.get(ssid)
+            if wlan_id:
+                log(f"      - Portal assets for WLAN: {ssid}")
+                portal_reports = import_wlan_portal_assets(api, "sites", site_id, wlan_id, assets)
+                for pr in portal_reports:
+                    report.append(f"site_wlan.{ssid}.{pr}")
+            else:
+                report.append(f"site_wlan.{ssid}.portal: WLAN not found, skipping portal assets")
+    
+    return report
+
+
+# ============================================================================
+# Site Management
+# ============================================================================
+
+def list_sites(api: MistApi, org_id: str) -> List[Dict[str, Any]]:
+    """Get all sites in an organization."""
+    return paged(api, f"/api/v1/orgs/{org_id}/sites")
+
+
+def get_or_create_site(api: MistApi, org_id: str, name: str, src_site: Dict[str, Any] = None) -> str:
+    """Get existing site by name or create new one."""
+    sites = list_sites(api, org_id)
+    for s in sites:
+        if s.get("name") == name:
             return s["id"]
-    created = http.post(f"/api/v1/orgs/{org_id}/sites", {"name": name})
-    return created["id"]
+    
+    # Create new site with basic properties from source
+    new_site = {"name": name}
+    if src_site:
+        for field in ["timezone", "country_code", "address", "latlng"]:
+            if field in src_site:
+                new_site[field] = src_site[field]
+    
+    if not DRY_RUN:
+        created = api.post(f"/api/v1/orgs/{org_id}/sites", new_site)
+        return created["id"]
+    else:
+        log(f"  Would create site: {name} (dry-run)")
+        return ""
 
-# ---------- main ----------
+
+def should_copy(resource: str) -> bool:
+    """Check if a resource type should be copied based on mode and settings."""
+    if COPY_MODE == "full":
+        return True
+    elif COPY_MODE == "org-only":
+        return not resource.startswith("site_") and resource not in [
+            "maps", "zones", "rssizones", "vbeacons", "beacons", "mxtunnels", 
+            "haclusters", "vcs"
+        ]
+    elif COPY_MODE == "sites-only":
+        return resource.startswith("site_") or resource in [
+            "maps", "zones", "rssizones", "vbeacons", "beacons", "mxtunnels",
+            "haclusters", "vcs", "site_settings"
+        ]
+    elif COPY_MODE == "selective":
+        return COPY_RESOURCES.get(resource, False)
+    return False
+
+
+# ============================================================================
+# Main Execution
+# ============================================================================
+
+def validate_config():
+    """Validate configuration before running."""
+    errors = []
+    
+    if not API_HOST_SRC:
+        errors.append("API_HOST_SRC is not set")
+    if not API_HOST_DST:
+        errors.append("API_HOST_DST is not set")
+    if not TOKEN_SRC:
+        errors.append("TOKEN_SRC is not set")
+    if not TOKEN_DST:
+        errors.append("TOKEN_DST is not set")
+    if not SRC_ORG_ID:
+        errors.append("SRC_ORG_ID is not set")
+    if not DST_ORG_ID:
+        errors.append("DST_ORG_ID is not set")
+    
+    for val in [API_HOST_SRC, API_HOST_DST, TOKEN_SRC, TOKEN_DST, SRC_ORG_ID, DST_ORG_ID]:
+        if val and ("PUT_" in str(val) or "YOUR_" in str(val)):
+            errors.append(f"Configuration contains placeholder value: {val[:20]}...")
+    
+    if errors:
+        for e in errors:
+            print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
 def main():
-    for var, val in [
-        ("API_HOST", API_HOST), ("TOKEN_SRC", TOKEN_SRC), ("TOKEN_DST", TOKEN_DST),
-        ("SRC_ORG_ID", SRC_ORG_ID), ("DST_ORG_ID", DST_ORG_ID)
-    ]:
-        if not val or "PUT_" in str(val):
-            sys.stderr.write(f"Set {var} at the top of the script.\n"); sys.exit(2)
+    """Main entry point."""
+    print("=" * 70)
+    print("Juniper Mist Full API Clone Tool")
+    print("=" * 70)
+    
+    # Validate configuration
+    validate_config()
+    
+    # Initialize API clients
+    src = MistApi(API_HOST_SRC, TOKEN_SRC, "src")
+    dst = MistApi(API_HOST_DST, TOKEN_DST, "dst")
+    mapper = IdMapper()
+    
+    # Test connectivity
+    log("Testing API connectivity...")
+    try:
+        src_self = src.get("/api/v1/self")
+        log(f"  Source: {src_self.get('email', 'OK')}")
+    except Exception as e:
+        print(f"ERROR: Cannot connect to source API - {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    try:
+        dst_self = dst.get("/api/v1/self")
+        log(f"  Destination: {dst_self.get('email', 'OK')}")
+    except Exception as e:
+        print(f"ERROR: Cannot connect to destination API - {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    if DRY_RUN:
+        print("\n*** DRY RUN MODE - No changes will be made ***\n")
+    
+    all_reports = []
+    
+    # Handle JSON import
+    if IMPORT_JSON:
+        log(f"Importing from JSON file: {IMPORT_JSON}")
+        with open(IMPORT_JSON, "r") as f:
+            full_blob = json.load(f)
+        
+        if "org" in full_blob:
+            reports = import_org(dst, DST_ORG_ID, full_blob["org"], mapper)
+            all_reports.extend(reports)
+        
+        if "sites" in full_blob:
+            for site_name, site_blob in full_blob["sites"].items():
+                log(f"\nProcessing site: {site_name}")
+                dst_site_id = get_or_create_site(dst, DST_ORG_ID, site_name)
+                if dst_site_id:
+                    reports = import_site(dst, dst_site_id, site_blob, mapper)
+                    all_reports.extend(reports)
+    
+    else:
+        # Export and import organization level
+        if COPY_MODE in ("full", "org-only", "selective"):
+            org_blob = export_org(src, SRC_ORG_ID)
+            
+            if EXPORT_JSON:
+                full_export = {"org": org_blob, "sites": {}}
+            else:
+                reports = import_org(dst, DST_ORG_ID, org_blob, mapper)
+                all_reports.extend(reports)
+        
+        # Process sites
+        if COPY_MODE in ("full", "sites-only", "selective"):
+            # Single site copy mode
+            if SRC_SITE_ID and DST_SITE_ID:
+                log(f"\nCopying single site: {SRC_SITE_ID} -> {DST_SITE_ID}")
+                site_blob = export_site(src, SRC_SITE_ID)
+                
+                if EXPORT_JSON:
+                    full_export["sites"]["single_site"] = site_blob
+                else:
+                    reports = import_site(dst, DST_SITE_ID, site_blob, mapper)
+                    all_reports.extend(reports)
+            
+            else:
+                # Multiple sites by name
+                src_sites = list_sites(src, SRC_ORG_ID)
+                
+                if LIMIT_SITE_NAMES:
+                    wanted = set(n.strip() for n in LIMIT_SITE_NAMES if n.strip())
+                    src_sites = [s for s in src_sites if s.get("name") in wanted]
+                    if not src_sites:
+                        log("No matching sites found for LIMIT_SITE_NAMES")
+                
+                dst_sites = by_key(list_sites(dst, DST_ORG_ID), "name")
+                
+                for src_site in src_sites:
+                    name = src_site.get("name", "")
+                    if not name:
+                        log(f"Skipping unnamed site: {src_site.get('id')}")
+                        continue
+                    
+                    log(f"\nProcessing site: {name}")
+                    site_blob = export_site(src, src_site["id"])
+                    
+                    if EXPORT_JSON:
+                        full_export["sites"][name] = site_blob
+                    else:
+                        dst_site_id = dst_sites.get(name, {}).get("id")
+                        if not dst_site_id:
+                            dst_site_id = get_or_create_site(dst, DST_ORG_ID, name, src_site)
+                            mapper.add("sites", src_site["id"], dst_site_id)
+                        
+                        if dst_site_id:
+                            reports = import_site(dst, dst_site_id, site_blob, mapper)
+                            all_reports.extend(reports)
+        
+        # Write JSON export
+        if EXPORT_JSON:
+            export_file = f"mist_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            with open(export_file, "w") as f:
+                json.dump(full_export, f, indent=2)
+            log(f"\nExported to: {export_file}")
+    
+    # Interactive inventory migration (after all sites are created so we have site mappings)
+    if should_copy("inventory") and INTERACTIVE_MODE and not EXPORT_JSON:
+        log("\n" + "=" * 70)
+        log("DEVICE INVENTORY MIGRATION")
+        log("=" * 70)
+        
+        # Export inventory from source
+        inventory = export_inventory(src, SRC_ORG_ID)
+        
+        if inventory:
+            reports = interactive_inventory_migration(
+                src, dst, SRC_ORG_ID, DST_ORG_ID, 
+                inventory, mapper
+            )
+            all_reports.extend(reports)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    
+    if all_reports:
+        created = sum(1 for r in all_reports if "created" in r)
+        updated = sum(1 for r in all_reports if "updated" in r)
+        unchanged = sum(1 for r in all_reports if "no change" in r)
+        failed = sum(1 for r in all_reports if "failed" in r)
+        
+        print(f"Created: {created}")
+        print(f"Updated: {updated}")
+        print(f"Unchanged: {unchanged}")
+        print(f"Failed: {failed}")
+        
+        if failed > 0:
+            print("\nFailed operations:")
+            for r in all_reports:
+                if "failed" in r:
+                    print(f"  - {r}")
+    
+    print(f"\nAPI calls: src={src.call_count}, dst={dst.call_count}")
+    print("=" * 70)
 
-    src = Http(API_HOST, TOKEN_SRC)
-    dst = Http(API_HOST, TOKEN_DST)
-
-    if COPY_MODE in ("org-only","org-and-sites"):
-        print("Exporting org objects from source...")
-        org_blob = export_org(src, SRC_ORG_ID)
-        print("Importing org objects to destination...")
-        rep = import_org(dst, DST_ORG_ID, org_blob)
-        for line in rep: print(" -", line)
-
-    if COPY_MODE in ("sites-only","org-and-sites"):
-        if SRC_SITE_ID and DST_SITE_ID:
-            print(f"Copy single site: {SRC_SITE_ID} -> {DST_SITE_ID}")
-            blob = export_site(src, SRC_SITE_ID)
-            rep = import_site(dst, DST_SITE_ID, blob)
-            for line in rep: print(" -", line)
-            return
-
-        src_sites = list_sites(src, SRC_ORG_ID)
-        if LIMIT_SITE_NAMES:
-            want = set(n.strip() for n in LIMIT_SITE_NAMES if n.strip())
-            src_sites = [s for s in src_sites if s.get("name") in want]
-            if not src_sites:
-                print("No matching sites in source org for LIMIT_SITE_NAMES.")
-                return
-
-        dst_sites_by_name = by_name(list_sites(dst, DST_ORG_ID))
-        for s_src in src_sites:
-            nm = s_src.get("name","")
-            if not nm:
-                print(f"Skipping unnamed site id={s_src.get('id')}")
-                continue
-            print(f"\nProcessing site: {nm}")
-            dst_site_id = dst_sites_by_name.get(nm, {}).get("id") or get_or_create_site_by_name(dst, DST_ORG_ID, nm)
-            blob = export_site(src, s_src["id"])
-            rep = import_site(dst, dst_site_id, blob)
-            for line in rep: print(" -", line)
 
 if __name__ == "__main__":
     main()
+
