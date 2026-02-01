@@ -4,7 +4,7 @@ Mist Copy — README
 
 This is a single-file Python script that copies a Mist org’s config into another org. It works anywhere you have Python 3 (macOS tested, Windows not tested).
 
-The majority of this is vibecoded. 
+Parts of the script were by Claude. All output was manually reviewed. 
 
 ---------------------------------
 What it copies (today)
