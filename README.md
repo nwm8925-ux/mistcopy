@@ -6,6 +6,8 @@ This is a single-file Python script that copies a Mist org’s config into anoth
 
 Parts of the script were by Claude. All output was manually reviewed. 
 
+V2 COMING SOON!!
+
 ---------------------------------
 What it copies (today)
 ---------------------------------
